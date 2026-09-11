@@ -1,0 +1,12 @@
+# Generated assessment output
+results/
+summary/
+
+# Logs and temporary files
+*.log
+*.tmp
+*.zip
+
+# PowerShell and editor artifacts
+*.clixml
+.vscode/
