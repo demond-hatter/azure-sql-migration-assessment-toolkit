@@ -55,6 +55,22 @@ function Get-FileLink {
     return ([System.Uri]::new((Resolve-Path $Path).Path)).AbsoluteUri
 }
 
+function Get-RelatedHtmlReport {
+    param(
+        [Parameter(Mandatory)][System.IO.FileInfo]$SourceFile,
+        [Parameter(Mandatory)][string]$NamePattern
+    )
+    $htmlFiles = @(Get-ChildItem $SourceFile.DirectoryName -File -Filter $NamePattern -ErrorAction SilentlyContinue)
+    $matchingBaseName = $htmlFiles | Where-Object BaseName -eq $SourceFile.BaseName | Select-Object -First 1
+    $htmlFile = if ($matchingBaseName) {
+        $matchingBaseName
+    } else {
+        $htmlFiles | Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 1
+    }
+    if ($htmlFile) { return $htmlFile }
+    return $null
+}
+
 function Get-RecommendationTarget {
     param([string]$RequestedTarget, [string]$Recommendation)
     if ($Recommendation -match '(?i)managed instance') { return 'AzureSqlManagedInstance' }
@@ -89,6 +105,7 @@ $recommendations = foreach ($file in $files | Where-Object { $_.Name -like '*-co
         $targetMatch = [regex]::Match($file.FullName, '(?i)[\\/](AzureSqlDatabase|AzureSqlManagedInstance|AzureSqlVirtualMachine|Any)[\\/]')
         $requestedTarget = if ($targetMatch.Success) { $targetMatch.Groups[1].Value } else { 'Any' }
         $recommendation = ($match.Groups['recommendation'].Value -replace '\s+',' ').Trim()
+        $htmlReport = Get-RelatedHtmlReport $file '*SkuRecommendationReport*.html'
         $sourceToken = if ($targetMatch.Success) {
             Split-Path (Split-Path $file.DirectoryName -Parent) -Leaf
         } else { '' }
@@ -98,6 +115,8 @@ $recommendations = foreach ($file in $files | Where-Object { $_.Name -like '*-co
             SourceToken=$sourceToken
             Target=Get-RecommendationTarget $requestedTarget $recommendation
             Recommendation=$recommendation
+            ReportLink=if ($htmlReport) { Get-FileLink $htmlReport.FullName } else { '' }
+            LastWriteTimeUtc=$file.LastWriteTimeUtc
         }
     }
 }
@@ -113,6 +132,7 @@ $assessmentRecords = foreach ($file in $files | Where-Object Extension -eq '.jso
         })
         if ($servers.Count -eq 0) { continue }
         $source = Get-SourceMetadata $file
+        $htmlReport = Get-RelatedHtmlReport $file '*SqlAssessment*.html'
         foreach ($server in $servers) {
             $properties = Get-PropertyValue $server 'Properties'
             $serverName = if ($source -and $source.ServerName) { [string]$source.ServerName } else { [string](Get-PropertyValue $properties 'ServerName') }
@@ -131,7 +151,7 @@ $assessmentRecords = foreach ($file in $files | Where-Object Extension -eq '.jso
                 SqlMiStatus=Get-ReadinessStatus $server 'AzureSqlManagedInstance'
                 SqlVmStatus=Get-ReadinessStatus $server 'AzureSqlVirtualMachine'
                 AssessmentReport=$file.FullName
-                AssessmentLink=Get-FileLink $file.FullName
+                AssessmentLink=if ($htmlReport) { Get-FileLink $htmlReport.FullName } else { '' }
                 LastWriteTimeUtc=$file.LastWriteTimeUtc
             }
         }
@@ -153,23 +173,26 @@ $instanceSummary = foreach ($assessment in $assessmentRecords |
         ($assessment.SourceToken -and $_.SourceToken -eq $assessment.SourceToken) -or
         $aliases -contains (Get-NormalizedIdentity $_.Instance)
     })
-    $sqlDbSku = @($matchingRecommendations | Where-Object Target -eq 'AzureSqlDatabase' | Select-Object -ExpandProperty Recommendation -Unique) -join ' | '
-    $sqlMiSku = @($matchingRecommendations | Where-Object Target -eq 'AzureSqlManagedInstance' | Select-Object -ExpandProperty Recommendation -Unique) -join ' | '
-    $sqlVmSku = @($matchingRecommendations | Where-Object Target -eq 'AzureSqlVirtualMachine' | Select-Object -ExpandProperty Recommendation -Unique) -join ' | '
+    $sqlDbRecommendation = $matchingRecommendations | Where-Object Target -eq 'AzureSqlDatabase' | Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 1
+    $sqlMiRecommendation = $matchingRecommendations | Where-Object Target -eq 'AzureSqlManagedInstance' | Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 1
+    $sqlVmRecommendation = $matchingRecommendations | Where-Object Target -eq 'AzureSqlVirtualMachine' | Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 1
     [pscustomobject][ordered]@{
         DisplayName=$assessment.DisplayName
         ServerName=$assessment.ServerName
         InstanceName=$assessment.InstanceName
         DataSource=$assessment.DataSource
         AzureSqlDatabaseCompatibility=$assessment.SqlDbStatus
-        AzureSqlDatabaseDetails=if ($assessment.SqlDbStatus -ne 'Ready') { $assessment.AssessmentLink } else { '' }
-        AzureSqlDatabaseSkuRecommendation=$sqlDbSku
+        AzureSqlDatabaseDetails=$assessment.AssessmentLink
+        AzureSqlDatabaseSkuRecommendation=if ($sqlDbRecommendation) { $sqlDbRecommendation.Recommendation } else { '' }
+        AzureSqlDatabaseSkuDetails=if ($sqlDbRecommendation) { $sqlDbRecommendation.ReportLink } else { '' }
         AzureSqlManagedInstanceCompatibility=$assessment.SqlMiStatus
-        AzureSqlManagedInstanceDetails=if ($assessment.SqlMiStatus -ne 'Ready') { $assessment.AssessmentLink } else { '' }
-        AzureSqlManagedInstanceSkuRecommendation=$sqlMiSku
+        AzureSqlManagedInstanceDetails=$assessment.AssessmentLink
+        AzureSqlManagedInstanceSkuRecommendation=if ($sqlMiRecommendation) { $sqlMiRecommendation.Recommendation } else { '' }
+        AzureSqlManagedInstanceSkuDetails=if ($sqlMiRecommendation) { $sqlMiRecommendation.ReportLink } else { '' }
         AzureSqlIaaSCompatibility=$assessment.SqlVmStatus
-        AzureSqlIaaSDetails=if ($assessment.SqlVmStatus -ne 'Ready') { $assessment.AssessmentLink } else { '' }
-        AzureSqlIaaSSkuRecommendation=$sqlVmSku
+        AzureSqlIaaSDetails=$assessment.AssessmentLink
+        AzureSqlIaaSSkuRecommendation=if ($sqlVmRecommendation) { $sqlVmRecommendation.Recommendation } else { '' }
+        AzureSqlIaaSSkuDetails=if ($sqlVmRecommendation) { $sqlVmRecommendation.ReportLink } else { '' }
         AssessmentReport=$assessment.AssessmentReport
     }
 }
@@ -186,11 +209,18 @@ function ConvertTo-HtmlText {
 function Get-CompatibilityCell {
     param([string]$Status, [string]$DetailsLink)
     $encodedStatus = ConvertTo-HtmlText $Status
-    if ($Status -eq 'Ready' -or [string]::IsNullOrWhiteSpace($DetailsLink)) {
-        return "<td class='ready'>$encodedStatus</td>"
+    $className = if ($Status -eq 'Ready') { 'ready' } else { 'review' }
+    if ([string]::IsNullOrWhiteSpace($DetailsLink)) { return "<td class='$className'>$encodedStatus</td>" }
+    return "<td class='$className'><a href='$(ConvertTo-HtmlText $DetailsLink)'>$encodedStatus</a></td>"
+}
+
+function Get-RecommendationCell {
+    param([string]$Recommendation, [string]$DetailsLink)
+    $encodedRecommendation = ConvertTo-HtmlText $Recommendation
+    if ([string]::IsNullOrWhiteSpace($Recommendation) -or [string]::IsNullOrWhiteSpace($DetailsLink)) {
+        return "<td>$encodedRecommendation</td>"
     }
-    $encodedLink = ConvertTo-HtmlText $DetailsLink
-    return "<td class='review'><a href='$encodedLink'>$encodedStatus</a></td>"
+    return "<td><a href='$(ConvertTo-HtmlText $DetailsLink)'>$encodedRecommendation</a></td>"
 }
 
 $instanceRows = foreach ($row in $instanceSummary) {
@@ -200,11 +230,11 @@ $instanceRows = foreach ($row in $instanceSummary) {
 <td>$(ConvertTo-HtmlText $row.ServerName)</td>
 <td>$(ConvertTo-HtmlText $row.InstanceName)</td>
 $(Get-CompatibilityCell $row.AzureSqlDatabaseCompatibility $row.AzureSqlDatabaseDetails)
-<td>$(ConvertTo-HtmlText $row.AzureSqlDatabaseSkuRecommendation)</td>
+$(Get-RecommendationCell $row.AzureSqlDatabaseSkuRecommendation $row.AzureSqlDatabaseSkuDetails)
 $(Get-CompatibilityCell $row.AzureSqlManagedInstanceCompatibility $row.AzureSqlManagedInstanceDetails)
-<td>$(ConvertTo-HtmlText $row.AzureSqlManagedInstanceSkuRecommendation)</td>
+$(Get-RecommendationCell $row.AzureSqlManagedInstanceSkuRecommendation $row.AzureSqlManagedInstanceSkuDetails)
 $(Get-CompatibilityCell $row.AzureSqlIaaSCompatibility $row.AzureSqlIaaSDetails)
-<td>$(ConvertTo-HtmlText $row.AzureSqlIaaSSkuRecommendation)</td>
+$(Get-RecommendationCell $row.AzureSqlIaaSSkuRecommendation $row.AzureSqlIaaSSkuDetails)
 </tr>
 "@
 }
