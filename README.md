@@ -199,6 +199,7 @@ Example for selected targets:
 The summary folder contains:
 
 - `assessment-summary.html`: browser-friendly overview of recommendations and output files.
+- `instance-assessment-summary.csv`: one row per source instance with SQL Database, Managed Instance, and Azure SQL IaaS compatibility results, detail links, and discovered SKU recommendations.
 - `sku-recommendations.csv`: recommendations extracted from console output.
 - `assessment-findings-filtered.csv`: JSON values likely related to findings, readiness, severity, and targets.
 - `json-details.csv`: flattened leaf values from all JSON reports.
