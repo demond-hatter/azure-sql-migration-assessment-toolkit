@@ -50,6 +50,23 @@ function Get-ReadinessStatus {
     return $status
 }
 
+function Get-ReadyWithWarningsCount {
+    param($Server, [Parameter(Mandatory)][string]$Target)
+    $count = 0
+    foreach ($database in @(Get-PropertyValue $Server 'Databases')) {
+        if ($null -eq $database) { continue }
+        $targetReadinesses = Get-PropertyValue $database 'TargetReadinesses'
+        $readiness = Get-PropertyValue $targetReadinesses $Target
+        if ([string](Get-PropertyValue $readiness 'RecommendationStatus') -ne 'Ready') { continue }
+        $warnings = @(Get-PropertyValue $database 'DatabaseAssessments' | Where-Object {
+            [string](Get-PropertyValue $_ 'IssueCategory') -eq 'Warning' -and
+            [string](Get-PropertyValue $_ 'AppliesToMigrationTargetPlatform') -eq $Target
+        })
+        if ($warnings.Count -gt 0) { $count++ }
+    }
+    return $count
+}
+
 function Get-FileLink {
     param([Parameter(Mandatory)][string]$Path)
     return ([System.Uri]::new((Resolve-Path $Path).Path)).AbsoluteUri
@@ -140,6 +157,7 @@ $assessmentRecords = foreach ($file in $files | Where-Object Extension -eq '.jso
             $dataSource = if ($source -and $source.DataSource) { [string]$source.DataSource } elseif ($instanceName) { "$serverName\$instanceName" } else { $serverName }
             $displayName = if ($source -and $source.Name) { [string]$source.Name } else { $dataSource }
             $sourceToken = if ($source) { Split-Path $file.DirectoryName -Leaf } else { '' }
+            $databases = @(Get-PropertyValue $server 'Databases' | Where-Object { $null -ne $_ })
             [pscustomobject]@{
                 Identity=Get-NormalizedIdentity $dataSource
                 DisplayName=$displayName
@@ -150,6 +168,9 @@ $assessmentRecords = foreach ($file in $files | Where-Object Extension -eq '.jso
                 SqlDbStatus=Get-ReadinessStatus $server 'AzureSqlDatabase'
                 SqlMiStatus=Get-ReadinessStatus $server 'AzureSqlManagedInstance'
                 SqlVmStatus=Get-ReadinessStatus $server 'AzureSqlVirtualMachine'
+                NumberOfDatabases=$databases.Count
+                SqlDbReadyWithWarnings=Get-ReadyWithWarningsCount $server 'AzureSqlDatabase'
+                SqlMiReadyWithWarnings=Get-ReadyWithWarningsCount $server 'AzureSqlManagedInstance'
                 AssessmentReport=$file.FullName
                 AssessmentLink=if ($htmlReport) { Get-FileLink $htmlReport.FullName } else { '' }
                 LastWriteTimeUtc=$file.LastWriteTimeUtc
@@ -181,11 +202,14 @@ $instanceSummary = foreach ($assessment in $assessmentRecords |
         ServerName=$assessment.ServerName
         InstanceName=$assessment.InstanceName
         DataSource=$assessment.DataSource
+        NumberOfDatabases=$assessment.NumberOfDatabases
         AzureSqlDatabaseCompatibility=$assessment.SqlDbStatus
+        AzureSqlDatabaseReadyWithWarnings=$assessment.SqlDbReadyWithWarnings
         AzureSqlDatabaseDetails=$assessment.AssessmentLink
         AzureSqlDatabaseSkuRecommendation=if ($sqlDbRecommendation) { $sqlDbRecommendation.Recommendation } else { '' }
         AzureSqlDatabaseSkuDetails=if ($sqlDbRecommendation) { $sqlDbRecommendation.ReportLink } else { '' }
         AzureSqlManagedInstanceCompatibility=$assessment.SqlMiStatus
+        AzureSqlManagedInstanceReadyWithWarnings=$assessment.SqlMiReadyWithWarnings
         AzureSqlManagedInstanceDetails=$assessment.AssessmentLink
         AzureSqlManagedInstanceSkuRecommendation=if ($sqlMiRecommendation) { $sqlMiRecommendation.Recommendation } else { '' }
         AzureSqlManagedInstanceSkuDetails=if ($sqlMiRecommendation) { $sqlMiRecommendation.ReportLink } else { '' }
@@ -229,9 +253,12 @@ $instanceRows = foreach ($row in $instanceSummary) {
 <td>$(ConvertTo-HtmlText $row.DisplayName)</td>
 <td>$(ConvertTo-HtmlText $row.ServerName)</td>
 <td>$(ConvertTo-HtmlText $row.InstanceName)</td>
+<td>$(ConvertTo-HtmlText $row.NumberOfDatabases)</td>
 $(Get-CompatibilityCell $row.AzureSqlDatabaseCompatibility $row.AzureSqlDatabaseDetails)
+<td>$(ConvertTo-HtmlText $row.AzureSqlDatabaseReadyWithWarnings)</td>
 $(Get-RecommendationCell $row.AzureSqlDatabaseSkuRecommendation $row.AzureSqlDatabaseSkuDetails)
 $(Get-CompatibilityCell $row.AzureSqlManagedInstanceCompatibility $row.AzureSqlManagedInstanceDetails)
+<td>$(ConvertTo-HtmlText $row.AzureSqlManagedInstanceReadyWithWarnings)</td>
 $(Get-RecommendationCell $row.AzureSqlManagedInstanceSkuRecommendation $row.AzureSqlManagedInstanceSkuDetails)
 $(Get-CompatibilityCell $row.AzureSqlIaaSCompatibility $row.AzureSqlIaaSDetails)
 $(Get-RecommendationCell $row.AzureSqlIaaSSkuRecommendation $row.AzureSqlIaaSSkuDetails)
@@ -239,7 +266,7 @@ $(Get-RecommendationCell $row.AzureSqlIaaSSkuRecommendation $row.AzureSqlIaaSSku
 "@
 }
 $instanceTable = if (@($instanceSummary).Count -gt 0) {
-    "<table><thead><tr><th>Display name</th><th>Server</th><th>Instance</th><th>SQL Database compatibility</th><th>SQL Database SKU</th><th>Managed Instance compatibility</th><th>Managed Instance SKU</th><th>Azure SQL IaaS compatibility</th><th>Azure SQL IaaS SKU</th></tr></thead><tbody>$($instanceRows -join [Environment]::NewLine)</tbody></table>"
+    "<table><thead><tr><th>Display name</th><th>Server</th><th>Instance</th><th>Databases</th><th>SQL Database compatibility</th><th>SQL DB ready with warnings</th><th>SQL Database SKU</th><th>Managed Instance compatibility</th><th>MI ready with warnings</th><th>Managed Instance SKU</th><th>Azure SQL IaaS compatibility</th><th>Azure SQL IaaS SKU</th></tr></thead><tbody>$($instanceRows -join [Environment]::NewLine)</tbody></table>"
 } else {
     "<p class='note'>No compatibility assessment reports were found under the results root.</p>"
 }
