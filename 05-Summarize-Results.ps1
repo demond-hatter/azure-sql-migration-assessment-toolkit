@@ -7,6 +7,7 @@ $ErrorActionPreference = 'Stop'
 if (-not (Test-Path $ResultsRoot)) { throw "Results folder not found: $ResultsRoot" }
 $ResultsRoot = (Resolve-Path $ResultsRoot).Path
 New-Item -ItemType Directory -Path $SummaryFolder -Force | Out-Null
+$SummaryFolder = (Resolve-Path $SummaryFolder).Path
 
 $files = Get-ChildItem $ResultsRoot -Recurse -File
 $catalog = $files | Select-Object @{n='RelativePath';e={$_.FullName.Substring($ResultsRoot.Length).TrimStart('\','/')}},Extension,Length,LastWriteTimeUtc
@@ -67,9 +68,11 @@ function Get-ReadyWithWarningsCount {
     return $count
 }
 
-function Get-FileLink {
+function Get-RelativeFileLink {
     param([Parameter(Mandatory)][string]$Path)
-    return ([System.Uri]::new((Resolve-Path $Path).Path)).AbsoluteUri
+    $summaryBase = [System.Uri]::new($SummaryFolder.TrimEnd('\','/') + [System.IO.Path]::DirectorySeparatorChar)
+    $target = [System.Uri]::new((Resolve-Path $Path).Path)
+    return $summaryBase.MakeRelativeUri($target).ToString()
 }
 
 function Get-RelatedHtmlReport {
@@ -132,7 +135,7 @@ $recommendations = foreach ($file in $files | Where-Object { $_.Name -like '*-co
             SourceToken=$sourceToken
             Target=Get-RecommendationTarget $requestedTarget $recommendation
             Recommendation=$recommendation
-            ReportLink=if ($htmlReport) { Get-FileLink $htmlReport.FullName } else { '' }
+            ReportLink=if ($htmlReport) { Get-RelativeFileLink $htmlReport.FullName } else { '' }
             LastWriteTimeUtc=$file.LastWriteTimeUtc
         }
     }
@@ -172,7 +175,7 @@ $assessmentRecords = foreach ($file in $files | Where-Object Extension -eq '.jso
                 SqlDbReadyWithWarnings=Get-ReadyWithWarningsCount $server 'AzureSqlDatabase'
                 SqlMiReadyWithWarnings=Get-ReadyWithWarningsCount $server 'AzureSqlManagedInstance'
                 AssessmentReport=$file.FullName
-                AssessmentLink=if ($htmlReport) { Get-FileLink $htmlReport.FullName } else { '' }
+                AssessmentLink=if ($htmlReport) { Get-RelativeFileLink $htmlReport.FullName } else { '' }
                 LastWriteTimeUtc=$file.LastWriteTimeUtc
             }
         }
@@ -231,20 +234,21 @@ function ConvertTo-HtmlText {
 }
 
 function Get-CompatibilityCell {
-    param([string]$Status, [string]$DetailsLink)
+    param([string]$Status, [string]$DetailsLink, [Parameter(Mandatory)][string]$SectionClass)
     $encodedStatus = ConvertTo-HtmlText $Status
-    $className = if ($Status -eq 'Ready') { 'ready' } else { 'review' }
+    $statusClass = if ($Status -eq 'Ready') { 'ready' } else { 'review' }
+    $className = "$SectionClass $statusClass"
     if ([string]::IsNullOrWhiteSpace($DetailsLink)) { return "<td class='$className'>$encodedStatus</td>" }
     return "<td class='$className'><a href='$(ConvertTo-HtmlText $DetailsLink)'>$encodedStatus</a></td>"
 }
 
 function Get-RecommendationCell {
-    param([string]$Recommendation, [string]$DetailsLink)
+    param([string]$Recommendation, [string]$DetailsLink, [Parameter(Mandatory)][string]$SectionClass)
     $encodedRecommendation = ConvertTo-HtmlText $Recommendation
     if ([string]::IsNullOrWhiteSpace($Recommendation) -or [string]::IsNullOrWhiteSpace($DetailsLink)) {
-        return "<td>$encodedRecommendation</td>"
+        return "<td class='$SectionClass'>$encodedRecommendation</td>"
     }
-    return "<td><a href='$(ConvertTo-HtmlText $DetailsLink)'>$encodedRecommendation</a></td>"
+    return "<td class='$SectionClass'><a href='$(ConvertTo-HtmlText $DetailsLink)'>$encodedRecommendation</a></td>"
 }
 
 $instanceRows = foreach ($row in $instanceSummary) {
@@ -254,26 +258,26 @@ $instanceRows = foreach ($row in $instanceSummary) {
 <td>$(ConvertTo-HtmlText $row.ServerName)</td>
 <td>$(ConvertTo-HtmlText $row.InstanceName)</td>
 <td>$(ConvertTo-HtmlText $row.NumberOfDatabases)</td>
-$(Get-CompatibilityCell $row.AzureSqlDatabaseCompatibility $row.AzureSqlDatabaseDetails)
-<td>$(ConvertTo-HtmlText $row.AzureSqlDatabaseReadyWithWarnings)</td>
-$(Get-RecommendationCell $row.AzureSqlDatabaseSkuRecommendation $row.AzureSqlDatabaseSkuDetails)
-$(Get-CompatibilityCell $row.AzureSqlManagedInstanceCompatibility $row.AzureSqlManagedInstanceDetails)
-<td>$(ConvertTo-HtmlText $row.AzureSqlManagedInstanceReadyWithWarnings)</td>
-$(Get-RecommendationCell $row.AzureSqlManagedInstanceSkuRecommendation $row.AzureSqlManagedInstanceSkuDetails)
-$(Get-CompatibilityCell $row.AzureSqlIaaSCompatibility $row.AzureSqlIaaSDetails)
-$(Get-RecommendationCell $row.AzureSqlIaaSSkuRecommendation $row.AzureSqlIaaSSkuDetails)
+$(Get-CompatibilityCell $row.AzureSqlDatabaseCompatibility $row.AzureSqlDatabaseDetails 'section-db')
+<td class='section-db'>$(ConvertTo-HtmlText $row.AzureSqlDatabaseReadyWithWarnings)</td>
+$(Get-RecommendationCell $row.AzureSqlDatabaseSkuRecommendation $row.AzureSqlDatabaseSkuDetails 'section-db')
+$(Get-CompatibilityCell $row.AzureSqlManagedInstanceCompatibility $row.AzureSqlManagedInstanceDetails 'section-mi')
+<td class='section-mi'>$(ConvertTo-HtmlText $row.AzureSqlManagedInstanceReadyWithWarnings)</td>
+$(Get-RecommendationCell $row.AzureSqlManagedInstanceSkuRecommendation $row.AzureSqlManagedInstanceSkuDetails 'section-mi')
+$(Get-CompatibilityCell $row.AzureSqlIaaSCompatibility $row.AzureSqlIaaSDetails 'section-iaas')
+$(Get-RecommendationCell $row.AzureSqlIaaSSkuRecommendation $row.AzureSqlIaaSSkuDetails 'section-iaas')
 </tr>
 "@
 }
 $instanceTable = if (@($instanceSummary).Count -gt 0) {
-    "<table><thead><tr><th>Display name</th><th>Server</th><th>Instance</th><th>Databases</th><th>SQL Database compatibility</th><th>SQL DB ready with warnings</th><th>SQL Database SKU</th><th>Managed Instance compatibility</th><th>MI ready with warnings</th><th>Managed Instance SKU</th><th>Azure SQL IaaS compatibility</th><th>Azure SQL IaaS SKU</th></tr></thead><tbody>$($instanceRows -join [Environment]::NewLine)</tbody></table>"
+    "<table><thead><tr><th>Display name</th><th>Server</th><th>Instance</th><th>Databases</th><th class='section-db'>SQL Database compatibility</th><th class='section-db'>SQL DB ready with warnings</th><th class='section-db'>SQL Database SKU</th><th class='section-mi'>Managed Instance compatibility</th><th class='section-mi'>MI ready with warnings</th><th class='section-mi'>Managed Instance SKU</th><th class='section-iaas'>Azure SQL IaaS compatibility</th><th class='section-iaas'>Azure SQL IaaS SKU</th></tr></thead><tbody>$($instanceRows -join [Environment]::NewLine)</tbody></table>"
 } else {
     "<p class='note'>No compatibility assessment reports were found under the results root.</p>"
 }
 
 $html = @"
 <!doctype html><html><head><meta charset='utf-8'><title>Azure SQL Assessment Summary</title>
-<style>body{font-family:Segoe UI,Arial;margin:32px;color:#242424}h1,h2{color:#0f6cbd}table{border-collapse:collapse;width:100%;margin-bottom:24px}th,td{border:1px solid #ddd;padding:8px;text-align:left;vertical-align:top}th{background:#eaf3fb}.note{background:#fff4ce;padding:12px;border-left:4px solid #f1c21b}.ready{background:#dff6dd}.review{background:#fff4ce}.review a{font-weight:600;color:#8a3707}</style></head><body>
+<style>body{font-family:Segoe UI,Arial;margin:32px;color:#242424}h1,h2{color:#0f6cbd}table{border-collapse:collapse;width:100%;margin-bottom:24px}th,td{border:1px solid #c8c8c8;padding:8px;text-align:left;vertical-align:top}th{background:#f2f2f2}.section-db{background:#e8f3ff}.section-mi{background:#e4f4ec}.section-iaas{background:#fff1df}th.section-db{background:#b9dcfa}th.section-mi{background:#b7dfcc}th.section-iaas{background:#ffd7a3}.note{background:#fff4ce;padding:12px;border-left:4px solid #f1c21b}.ready{border-left:4px solid #107c10}.review{border-left:4px solid #d83b01}.ready a{font-weight:600;color:#0b6a0b}.review a{font-weight:600;color:#8a3707}</style></head><body>
 <h1>Azure SQL Migration Assessment Summary</h1>
 <p>Generated $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss zzz')</p>
 <div class='note'>Validate compatibility findings before accepting a SKU. Performance sizing does not resolve feature blockers, cross-database dependencies, latency requirements, or operational constraints.</div>
