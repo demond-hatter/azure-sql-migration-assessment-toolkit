@@ -2,6 +2,8 @@
 
 This PowerShell toolkit helps collect the technical evidence needed to plan migrations from SQL Server to Azure SQL. It validates source connections, runs compatibility assessments, captures representative workload performance, generates Azure SKU recommendations, and consolidates the resulting files for review.
 
+> **Note:** This toolkit is intended for scenarios where Azure Arc or an Azure Migrate appliance is not deployed and cannot be deployed quickly. If Azure Arc or Azure Migrate is already deployed, use that service to generate the assessment instead.
+
 The toolkit can evaluate potential placement on:
 
 - Azure SQL Database
