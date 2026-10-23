@@ -1,0 +1,190 @@
+resources
+| where type =~ "microsoft.azurearcdata/sqlserverinstances"
+| extend Assessment = properties.migration.assessment
+| where isnotnull(Assessment)
+| extend Recommendations = Assessment.skuRecommendationResults
+| mv-expand TargetName = bag_keys(Recommendations) to typeof(string)
+| extend Recommendation = Recommendations[TargetName]
+| mv-expand CostOption = Recommendation.monthlyCostOptions
+| extend
+    AssessmentEnabled = tobool(Assessment.enabled),
+    AssessmentUploadTime = todatetime(Assessment.assessmentUploadTime),
+    ServerResourceId = tolower(id),
+    TargetJoinKey = tolower(TargetName),
+    LookbackDays = toint(Assessment.settings.lookbackPeriodInDays),
+    Percentile = toint(Assessment.settings.percentile),
+    TargetLocation = tostring(Assessment.settings.targetLocation),
+    Currency = tostring(Assessment.settings.currency),
+    MigrationStrategy = tostring(Assessment.settings.strategy),
+    RecommendationStatus = tostring(Recommendation.recommendationStatus),
+    BlockerCount = toint(Recommendation.numberOfServerBlockerIssues),
+    PricingOption = tostring(CostOption.keyName),
+    OptionComputeCost = todouble(CostOption.keyValue.computeCost),
+    OptionStorageCost = todouble(CostOption.keyValue.storageCost),
+    OptionIopsCost = todouble(CostOption.keyValue.iopsCost),
+    MonthlyComputeCost = todouble(Recommendation.monthlyCost.computeCost),
+    MonthlyStorageCost = todouble(Recommendation.monthlyCost.storageCost),
+    MonthlyIopsCost = todouble(Recommendation.monthlyCost.iopsCost),
+    WindowsLicenseCost = todouble(Recommendation.monthlyCost.windowsLicenseCost),
+    SqlLicenseCost = todouble(Recommendation.monthlyCost.sqlLicenseCost),
+    MonthlyTotalCost = todouble(Recommendation.monthlyCost.totalCost),
+    PredictedDataSizeMb = todouble(Recommendation.targetSku.predictedDataSizeInMb),
+    PredictedLogSizeMb = todouble(Recommendation.targetSku.predictedLogSizeInMb),
+    ComputeSize = toint(Recommendation.targetSku.computeSize),
+    StorageMaxSizeMb = toint(Recommendation.targetSku.storageMaxSizeInMb),
+    SqlPurchasingModel = tostring(Recommendation.targetSku.category.sqlPurchasingModel),
+    SqlServiceTier = tostring(Recommendation.targetSku.category.sqlServiceTier),
+    HardwareType = tostring(Recommendation.targetSku.category.hardwareType),
+    ComputeTier = tostring(Recommendation.targetSku.category.computeTier),
+    ZoneRedundancyAvailable =
+        tobool(Recommendation.targetSku.category.zoneRedundancyAvailable),
+    VmFamily = tostring(Recommendation.targetSku.category.virtualMachineFamily),
+    VmSku = tostring(Recommendation.targetSku.virtualMachineSize.azureSkuName),
+    VmSize = tostring(Recommendation.targetSku.virtualMachineSize.sizeName),
+    VmVcpus = toint(Recommendation.targetSku.virtualMachineSize.vCPUsAvailable),
+    AvailableVmSkus = Recommendation.targetSku.category.availableVmSkus,
+    DataDisks = Recommendation.targetSku.dataDiskSizes,
+    LogDisks = Recommendation.targetSku.logDiskSizes,
+    TempDbDisks = Recommendation.targetSku.tempDbDiskSizes,
+    ImpactedObjects = Assessment.impactedObjectsSummary[TargetName],
+    ServerAssessments = Assessment.serverAssessments
+| join kind=leftouter (
+    resources
+    | where type =~ "microsoft.azurearcdata/sqlserverinstances/databases"
+    | extend DatabaseAssessment = properties.migration.assessment
+    | where isnotnull(DatabaseAssessment)
+    | extend
+        DatabaseServerResourceId =
+            tolower(substring(id, 0, indexof(tolower(id), "/databases/"))),
+        DatabaseTargetReadiness = DatabaseAssessment.targetReadiness
+    | mv-expand DatabaseTargetName = bag_keys(DatabaseTargetReadiness) to typeof(string)
+    | extend DatabaseTarget = DatabaseTargetReadiness[DatabaseTargetName]
+    | project
+        DatabaseServerResourceId,
+        DatabaseTargetJoinKey = tolower(DatabaseTargetName),
+        DatabaseResourceId = id,
+        DatabaseName = name,
+        DatabaseState = tostring(properties.state),
+        DatabaseAssessmentUploadTime =
+            todatetime(DatabaseAssessment.assessmentUploadTime),
+        DatabaseCompatibilityLevel = toint(properties.compatibilityLevel),
+        DatabaseSizeMb = todouble(properties.sizeMB),
+        DatabaseDataFileSizeMb = todouble(properties.dataFileSizeMB),
+        DatabaseLogFileSizeMb = todouble(properties.logFileSizeMB),
+        DatabaseRecommendationStatus =
+            tostring(DatabaseTarget.recommendationStatus),
+        DatabaseBlockerCount = toint(DatabaseTarget.numOfBlockerIssues),
+        DatabaseMonthlyCostOptions = DatabaseTarget.monthlyCostOptions,
+        DatabaseMonthlyComputeCost =
+            todouble(DatabaseTarget.monthlyCost.computeCost),
+        DatabaseMonthlyStorageCost =
+            todouble(DatabaseTarget.monthlyCost.storageCost),
+        DatabaseMonthlyIopsCost =
+            todouble(DatabaseTarget.monthlyCost.iopsCost),
+        DatabaseSqlLicenseCost =
+            todouble(DatabaseTarget.monthlyCost.sqlLicenseCost),
+        DatabaseMonthlyTotalCost =
+            todouble(DatabaseTarget.monthlyCost.totalCost),
+        DatabasePredictedDataSizeMb =
+            todouble(DatabaseTarget.targetSku.predictedDataSizeInMb),
+        DatabasePredictedLogSizeMb =
+            todouble(DatabaseTarget.targetSku.predictedLogSizeInMb),
+        DatabaseComputeSize = toint(DatabaseTarget.targetSku.computeSize),
+        DatabaseStorageMaxSizeMb =
+            toint(DatabaseTarget.targetSku.storageMaxSizeInMb),
+        DatabaseSqlPurchasingModel =
+            tostring(DatabaseTarget.targetSku.category.sqlPurchasingModel),
+        DatabaseSqlServiceTier =
+            tostring(DatabaseTarget.targetSku.category.sqlServiceTier),
+        DatabaseHardwareType =
+            tostring(DatabaseTarget.targetSku.category.hardwareType),
+        DatabaseComputeTier =
+            tostring(DatabaseTarget.targetSku.category.computeTier),
+        DatabaseZoneRedundancyAvailable =
+            tobool(DatabaseTarget.targetSku.category.zoneRedundancyAvailable),
+        DatabaseAssessmentIssueCountAllTargets =
+            array_length(DatabaseAssessment.databaseAssessments),
+        DatabaseAssessmentIssuesAllTargets =
+            DatabaseAssessment.databaseAssessments
+) on
+    $left.ServerResourceId == $right.DatabaseServerResourceId,
+    $left.TargetJoinKey == $right.DatabaseTargetJoinKey
+| project
+    subscriptionId,
+    resourceGroup,
+    SqlServerInstance = name,
+    id,
+    ServerVersion = tostring(properties.version),
+    CurrentVersion = tostring(properties.currentVersion),
+    Edition = tostring(properties.edition),
+    AssessmentEnabled,
+    AssessmentUploadTime,
+    LookbackDays,
+    Percentile,
+    TargetLocation,
+    Currency,
+    MigrationStrategy,
+    TargetName,
+    RecommendationStatus,
+    BlockerCount,
+    PricingOption,
+    OptionComputeCost,
+    OptionStorageCost,
+    OptionIopsCost,
+    MonthlyComputeCost,
+    MonthlyStorageCost,
+    MonthlyIopsCost,
+    WindowsLicenseCost,
+    SqlLicenseCost,
+    MonthlyTotalCost,
+    PredictedDataSizeMb,
+    PredictedLogSizeMb,
+    ComputeSize,
+    StorageMaxSizeMb,
+    SqlPurchasingModel,
+    SqlServiceTier,
+    HardwareType,
+    ComputeTier,
+    ZoneRedundancyAvailable,
+    VmFamily,
+    VmSku,
+    VmSize,
+    VmVcpus,
+    AvailableVmSkus,
+    DataDisks,
+    LogDisks,
+    TempDbDisks,
+    ImpactedObjects,
+    ServerAssessments,
+    DatabaseResourceId,
+    DatabaseName,
+    DatabaseState,
+    DatabaseAssessmentUploadTime,
+    DatabaseCompatibilityLevel,
+    DatabaseSizeMb,
+    DatabaseDataFileSizeMb,
+    DatabaseLogFileSizeMb,
+    DatabaseRecommendationStatus,
+    DatabaseBlockerCount,
+    DatabaseMonthlyCostOptions,
+    DatabaseMonthlyComputeCost,
+    DatabaseMonthlyStorageCost,
+    DatabaseMonthlyIopsCost,
+    DatabaseSqlLicenseCost,
+    DatabaseMonthlyTotalCost,
+    DatabasePredictedDataSizeMb,
+    DatabasePredictedLogSizeMb,
+    DatabaseComputeSize,
+    DatabaseStorageMaxSizeMb,
+    DatabaseSqlPurchasingModel,
+    DatabaseSqlServiceTier,
+    DatabaseHardwareType,
+    DatabaseComputeTier,
+    DatabaseZoneRedundancyAvailable,
+    DatabaseAssessmentIssueCountAllTargets,
+    DatabaseAssessmentIssuesAllTargets
+| order by
+    SqlServerInstance asc,
+    DatabaseName asc,
+    TargetName asc,
+    PricingOption asc
