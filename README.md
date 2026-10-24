@@ -198,14 +198,24 @@ Example for selected targets:
   -SummaryFolder '.\summary'
 ```
 
+The script creates `SummaryFolder`, including missing parent directories, if it does not exist. An existing directory is reused; a path pointing to a file produces an error.
+
 The summary folder contains:
 
-- `assessment-summary.html`: browser-friendly overview of recommendations and output files.
+- `assessment-summary.html`: responsive, light/dark browser report retaining Display Name, Server, Instance, and Databases, followed by distinct Azure SQL Database, Azure SQL Managed Instance, and SQL Server on Azure VM column groups. Each target has Compatibility, Warnings, and SKU Recommendation columns. Ready appears in green with a check mark; Not Ready and Not Assessed appear in red with an X. Ready and Not Ready link to the underlying HTML assessment when available, otherwise to the source JSON assessment. Not Assessed never links to an assessment. SKU recommendations link to their HTML reports when available.
 - `instance-assessment-summary.csv`: one row per source instance with SQL Database, Managed Instance, and Azure SQL IaaS compatibility results, detail links, and discovered SKU recommendations.
 - `sku-recommendations.csv`: recommendations extracted from console output.
 - `assessment-findings-filtered.csv`: JSON values likely related to findings, readiness, severity, and targets.
 - `json-details.csv`: flattened leaf values from all JSON reports.
 - `file-catalog.csv`: inventory of files under the results root.
+
+The HTML report contains only the combined instance compatibility and SKU recommendation table. Standalone SKU recommendations and output inventory remain available as CSV exports, not additional HTML tables.
+
+All generated report links, including the instance CSV's detail links and `AssessmentReport` path, are relative to the summary folder, not the shell's working directory. Keep `ResultsRoot` and `SummaryFolder` on the same drive or network share. To move or share the report, move both folders together while preserving their relative layout (for example, keep `results` and `summary` as siblings inside a common parent folder). Moving only the summary folder does not include its linked assessment or SKU files.
+
+Warnings counts databases that are Ready for that target and have at least one warning finding, matching the existing SQL Database and Managed Instance warning-count behavior and extending it to Azure VM. It is not a total finding count; zero does not imply that the target was assessed or has no blockers. The instance CSV retains its existing fields and adds `AzureSqlIaaSReadyWithWarnings` for VM warning counts. Missing SKU recommendations display as **Not available** in the HTML report.
+
+To validate summary generation with synthetic fixtures (no SQL Server or Azure connection required), run `.\tests\Test-Summarize-Results.ps1` in Windows PowerShell 5.1 or PowerShell 7. Add `-KeepArtifacts` to retain the generated reports for visual inspection; otherwise the tests clean up their temporary files.
 
 ## Output and Data Handling
 
