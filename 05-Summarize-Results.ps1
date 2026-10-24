@@ -1,13 +1,20 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory)][string]$ResultsRoot,
-    [string]$SummaryFolder = (Join-Path $PSScriptRoot 'summary')
+    [string]$SummaryFolder = (Join-Path $ResultsRoot -ChildPath 'summary')
 )
 $ErrorActionPreference = 'Stop'
 if (-not (Test-Path $ResultsRoot)) { throw "Results folder not found: $ResultsRoot" }
 $ResultsRoot = (Resolve-Path $ResultsRoot).Path
-New-Item -ItemType Directory -Path $SummaryFolder -Force | Out-Null
-$SummaryFolder = (Resolve-Path $SummaryFolder).Path
+if (-not (Test-Path -LiteralPath $SummaryFolder)) {
+    New-Item -ItemType Directory -Path $SummaryFolder -Force | Out-Null
+} elseif (-not (Test-Path -LiteralPath $SummaryFolder -PathType Container)) {
+    throw "Summary folder path is not a directory: $SummaryFolder"
+}
+$SummaryFolder = (Resolve-Path -LiteralPath $SummaryFolder).Path
+if ([System.IO.Path]::GetPathRoot($ResultsRoot) -ne [System.IO.Path]::GetPathRoot($SummaryFolder)) {
+    throw 'ResultsRoot and SummaryFolder must be on the same drive or network share so report links can be relative.'
+}
 
 $files = Get-ChildItem $ResultsRoot -Recurse -File
 $catalog = $files | Select-Object @{n='RelativePath';e={$_.FullName.Substring($ResultsRoot.Length).TrimStart('\','/')}},Extension,Length,LastWriteTimeUtc
@@ -48,6 +55,7 @@ function Get-ReadinessStatus {
     if (-not $readiness) { return 'Not assessed' }
     $status = [string](Get-PropertyValue $readiness 'RecommendationStatus')
     if ([string]::IsNullOrWhiteSpace($status)) { return 'Unknown' }
+    if (($status -replace '[\s_-]', '') -eq 'NotAssessed') { return 'Not assessed' }
     return $status
 }
 
@@ -80,12 +88,12 @@ function Get-RelatedHtmlReport {
         [Parameter(Mandatory)][System.IO.FileInfo]$SourceFile,
         [Parameter(Mandatory)][string]$NamePattern
     )
-    $htmlFiles = @(Get-ChildItem $SourceFile.DirectoryName -File -Filter $NamePattern -ErrorAction SilentlyContinue)
+    $htmlFiles = @(Get-ChildItem $SourceFile.DirectoryName -File -Filter '*.html' -ErrorAction SilentlyContinue)
     $matchingBaseName = $htmlFiles | Where-Object BaseName -eq $SourceFile.BaseName | Select-Object -First 1
     $htmlFile = if ($matchingBaseName) {
         $matchingBaseName
     } else {
-        $htmlFiles | Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 1
+        $htmlFiles | Where-Object Name -like $NamePattern | Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 1
     }
     if ($htmlFile) { return $htmlFile }
     return $null
@@ -174,8 +182,9 @@ $assessmentRecords = foreach ($file in $files | Where-Object Extension -eq '.jso
                 NumberOfDatabases=$databases.Count
                 SqlDbReadyWithWarnings=Get-ReadyWithWarningsCount $server 'AzureSqlDatabase'
                 SqlMiReadyWithWarnings=Get-ReadyWithWarningsCount $server 'AzureSqlManagedInstance'
-                AssessmentReport=$file.FullName
-                AssessmentLink=if ($htmlReport) { Get-RelativeFileLink $htmlReport.FullName } else { '' }
+                SqlVmReadyWithWarnings=Get-ReadyWithWarningsCount $server 'AzureSqlVirtualMachine'
+                AssessmentReport=Get-RelativeFileLink $file.FullName
+                AssessmentLink=if ($htmlReport) { Get-RelativeFileLink $htmlReport.FullName } else { Get-RelativeFileLink $file.FullName }
                 LastWriteTimeUtc=$file.LastWriteTimeUtc
             }
         }
@@ -208,16 +217,17 @@ $instanceSummary = foreach ($assessment in $assessmentRecords |
         NumberOfDatabases=$assessment.NumberOfDatabases
         AzureSqlDatabaseCompatibility=$assessment.SqlDbStatus
         AzureSqlDatabaseReadyWithWarnings=$assessment.SqlDbReadyWithWarnings
-        AzureSqlDatabaseDetails=$assessment.AssessmentLink
+        AzureSqlDatabaseDetails=if ($assessment.SqlDbStatus -ne 'Not assessed') { $assessment.AssessmentLink } else { '' }
         AzureSqlDatabaseSkuRecommendation=if ($sqlDbRecommendation) { $sqlDbRecommendation.Recommendation } else { '' }
         AzureSqlDatabaseSkuDetails=if ($sqlDbRecommendation) { $sqlDbRecommendation.ReportLink } else { '' }
         AzureSqlManagedInstanceCompatibility=$assessment.SqlMiStatus
         AzureSqlManagedInstanceReadyWithWarnings=$assessment.SqlMiReadyWithWarnings
-        AzureSqlManagedInstanceDetails=$assessment.AssessmentLink
+        AzureSqlManagedInstanceDetails=if ($assessment.SqlMiStatus -ne 'Not assessed') { $assessment.AssessmentLink } else { '' }
         AzureSqlManagedInstanceSkuRecommendation=if ($sqlMiRecommendation) { $sqlMiRecommendation.Recommendation } else { '' }
         AzureSqlManagedInstanceSkuDetails=if ($sqlMiRecommendation) { $sqlMiRecommendation.ReportLink } else { '' }
         AzureSqlIaaSCompatibility=$assessment.SqlVmStatus
-        AzureSqlIaaSDetails=$assessment.AssessmentLink
+        AzureSqlIaaSReadyWithWarnings=$assessment.SqlVmReadyWithWarnings
+        AzureSqlIaaSDetails=if ($assessment.SqlVmStatus -ne 'Not assessed') { $assessment.AssessmentLink } else { '' }
         AzureSqlIaaSSkuRecommendation=if ($sqlVmRecommendation) { $sqlVmRecommendation.Recommendation } else { '' }
         AzureSqlIaaSSkuDetails=if ($sqlVmRecommendation) { $sqlVmRecommendation.ReportLink } else { '' }
         AssessmentReport=$assessment.AssessmentReport
@@ -235,16 +245,28 @@ function ConvertTo-HtmlText {
 
 function Get-CompatibilityCell {
     param([string]$Status, [string]$DetailsLink, [Parameter(Mandatory)][string]$SectionClass)
-    $encodedStatus = ConvertTo-HtmlText $Status
-    $statusClass = if ($Status -eq 'Ready') { 'ready' } else { 'review' }
-    $className = "$SectionClass $statusClass"
-    if ([string]::IsNullOrWhiteSpace($DetailsLink)) { return "<td class='$className'>$encodedStatus</td>" }
-    return "<td class='$className'><a href='$(ConvertTo-HtmlText $DetailsLink)'>$encodedStatus</a></td>"
+    $normalizedStatus = $Status -replace '[\s_-]', ''
+    $displayStatus = switch ($normalizedStatus) {
+        'Ready' { 'Ready' }
+        'NotReady' { 'Not Ready' }
+        'NotAssessed' { 'Not Assessed' }
+        default { if ([string]::IsNullOrWhiteSpace($Status)) { 'Unknown' } else { $Status } }
+    }
+    $statusClass = if ($normalizedStatus -eq 'Ready') { 'ready' } else { 'not-ready' }
+    $icon = if ($normalizedStatus -eq 'Ready') { '&#10003;' } else { 'X' }
+    $badge = "<span class='status $statusClass'><span aria-hidden='true'>$icon</span>$(ConvertTo-HtmlText $displayStatus)</span>"
+    if ($normalizedStatus -eq 'NotAssessed' -or [string]::IsNullOrWhiteSpace($DetailsLink)) {
+        return "<td class='$SectionClass group-start'>$badge</td>"
+    }
+    return "<td class='$SectionClass group-start'><a class='status-link' title='View underlying assessment' href='$(ConvertTo-HtmlText $DetailsLink)'>$badge</a></td>"
 }
 
 function Get-RecommendationCell {
     param([string]$Recommendation, [string]$DetailsLink, [Parameter(Mandatory)][string]$SectionClass)
     $encodedRecommendation = ConvertTo-HtmlText $Recommendation
+    if ([string]::IsNullOrWhiteSpace($Recommendation)) {
+        return "<td class='$SectionClass'><span class='muted'>Not available</span></td>"
+    }
     if ([string]::IsNullOrWhiteSpace($Recommendation) -or [string]::IsNullOrWhiteSpace($DetailsLink)) {
         return "<td class='$SectionClass'>$encodedRecommendation</td>"
     }
@@ -265,30 +287,149 @@ $(Get-CompatibilityCell $row.AzureSqlManagedInstanceCompatibility $row.AzureSqlM
 <td class='section-mi'>$(ConvertTo-HtmlText $row.AzureSqlManagedInstanceReadyWithWarnings)</td>
 $(Get-RecommendationCell $row.AzureSqlManagedInstanceSkuRecommendation $row.AzureSqlManagedInstanceSkuDetails 'section-mi')
 $(Get-CompatibilityCell $row.AzureSqlIaaSCompatibility $row.AzureSqlIaaSDetails 'section-iaas')
+<td class='section-iaas'>$(ConvertTo-HtmlText $row.AzureSqlIaaSReadyWithWarnings)</td>
 $(Get-RecommendationCell $row.AzureSqlIaaSSkuRecommendation $row.AzureSqlIaaSSkuDetails 'section-iaas')
 </tr>
 "@
 }
 $instanceTable = if (@($instanceSummary).Count -gt 0) {
-    "<table><thead><tr><th>Display name</th><th>Server</th><th>Instance</th><th>Databases</th><th class='section-db'>SQL Database compatibility</th><th class='section-db'>SQL DB ready with warnings</th><th class='section-db'>SQL Database SKU</th><th class='section-mi'>Managed Instance compatibility</th><th class='section-mi'>MI ready with warnings</th><th class='section-mi'>Managed Instance SKU</th><th class='section-iaas'>Azure SQL IaaS compatibility</th><th class='section-iaas'>Azure SQL IaaS SKU</th></tr></thead><tbody>$($instanceRows -join [Environment]::NewLine)</tbody></table>"
+    @"
+<div class='table-scroll' role='region' aria-label='Instance compatibility and SKU recommendations' tabindex='0'>
+<table class='instance-table'>
+<thead>
+<tr>
+<th rowspan='2' scope='col'>Display Name</th><th rowspan='2' scope='col'>Server</th><th rowspan='2' scope='col'>Instance</th><th rowspan='2' scope='col'>Databases</th>
+<th colspan='3' scope='colgroup' class='section-db group-start target-heading'>Azure SQL Database</th>
+<th colspan='3' scope='colgroup' class='section-mi group-start target-heading'>Azure SQL Managed Instance</th>
+<th colspan='3' scope='colgroup' class='section-iaas group-start target-heading'>SQL Server on Azure VM</th>
+</tr>
+<tr>
+<th scope='col' class='section-db group-start'>Compatibility</th><th scope='col' class='section-db'>Warnings</th><th scope='col' class='section-db'>SKU Recommendation</th>
+<th scope='col' class='section-mi group-start'>Compatibility</th><th scope='col' class='section-mi'>Warnings</th><th scope='col' class='section-mi'>SKU Recommendation</th>
+<th scope='col' class='section-iaas group-start'>Compatibility</th><th scope='col' class='section-iaas'>Warnings</th><th scope='col' class='section-iaas'>SKU Recommendation</th>
+</tr>
+</thead><tbody>$($instanceRows -join [Environment]::NewLine)</tbody>
+</table>
+</div>
+"@
 } else {
     "<p class='note'>No compatibility assessment reports were found under the results root.</p>"
 }
 
 $html = @"
-<!doctype html><html><head><meta charset='utf-8'><title>Azure SQL Assessment Summary</title>
-<style>body{font-family:Segoe UI,Arial;margin:32px;color:#242424}h1,h2{color:#0f6cbd}table{border-collapse:collapse;width:100%;margin-bottom:24px}th,td{border:1px solid #c8c8c8;padding:8px;text-align:left;vertical-align:top}th{background:#f2f2f2}.section-db{background:#e8f3ff}.section-mi{background:#e4f4ec}.section-iaas{background:#fff1df}th.section-db{background:#b9dcfa}th.section-mi{background:#b7dfcc}th.section-iaas{background:#ffd7a3}.note{background:#fff4ce;padding:12px;border-left:4px solid #f1c21b}.ready{border-left:4px solid #107c10}.review{border-left:4px solid #d83b01}.ready a{font-weight:600;color:#0b6a0b}.review a{font-weight:600;color:#8a3707}</style></head><body>
+<!doctype html><html lang='en'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width, initial-scale=1'><title>Azure SQL Assessment Summary</title>
+<script>
+  (() => {
+    const param = new URLSearchParams(window.location.search).get("scoutTheme");
+    const theme =
+      param || (window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
+    document.documentElement.setAttribute("data-theme", theme);
+  })();
+</script>
+<style>
+:root {
+  color-scheme: light;
+  --cp-bg: #f7f4ef;
+  --cp-bg-elevated: #fcfbf8;
+  --cp-surface: #ffffff;
+  --cp-surface-soft: #f5f5f5;
+  --cp-border: #dedede;
+  --cp-border-strong: #919191;
+  --cp-text: #242424;
+  --cp-text-muted: #5c5c5c;
+  --cp-text-soft: #6f6f6f;
+  --cp-accent: #b11f4b;
+  --cp-accent-hover: #9a1a41;
+  --cp-accent-soft: rgba(177, 31, 75, 0.08);
+  --cp-accent-fg: #ffffff;
+  --cp-success: #16a34a;
+  --cp-danger: #dc2626;
+  --cp-warning: #f59e0b;
+  --cp-link: #0078d4;
+  --cp-shadow: 0 18px 48px rgba(0, 0, 0, 0.12);
+  --cp-overlay: rgba(255, 255, 255, 0.8);
+  --cp-panel: rgba(255, 255, 255, 0.86);
+  --cp-panel-strong: rgba(255, 255, 255, 0.96);
+  --cp-sheen: rgba(255, 255, 255, 0.55);
+  --cp-highlight: rgba(177, 31, 75, 0.12);
+}
+html[data-theme="dark"] {
+  color-scheme: dark;
+  --cp-bg: #3d3b3a;
+  --cp-bg-elevated: #343231;
+  --cp-surface: #292929;
+  --cp-surface-soft: #2e2e2e;
+  --cp-border: #474747;
+  --cp-border-strong: #5f5f5f;
+  --cp-text: #dedede;
+  --cp-text-muted: #919191;
+  --cp-text-soft: #b0b0b0;
+  --cp-accent: #fd8ea1;
+  --cp-accent-hover: #fb7b91;
+  --cp-accent-soft: rgba(253, 142, 161, 0.14);
+  --cp-accent-fg: #1a1a1a;
+  --cp-success: #4ade80;
+  --cp-danger: #f87171;
+  --cp-warning: #fbbf24;
+  --cp-link: #4da6ff;
+  --cp-shadow: 0 18px 48px rgba(0, 0, 0, 0.32);
+  --cp-overlay: rgba(41, 41, 41, 0.88);
+  --cp-panel: rgba(41, 41, 41, 0.72);
+  --cp-panel-strong: rgba(41, 41, 41, 0.96);
+  --cp-sheen: rgba(255, 255, 255, 0.04);
+  --cp-highlight: rgba(253, 142, 161, 0.12);
+}
+* { box-sizing: border-box; }
+body { margin: 0; padding: 32px; background: var(--cp-bg); color: var(--cp-text); font-family: "Segoe UI", Aptos, Calibri, -apple-system, BlinkMacSystemFont, sans-serif; font-size: 14px; line-height: 1.5; }
+main { max-width: 1920px; margin: 0 auto; }
+header { margin-bottom: 24px; }
+.eyebrow { color: var(--cp-accent); font-size: 12px; font-weight: 700; letter-spacing: .12em; text-transform: uppercase; }
+h1 { margin: 8px 0; font-size: 32px; font-weight: 650; letter-spacing: -.025em; }
+h2 { margin: 0 0 8px; font-size: 20px; font-weight: 600; }
+p { margin: 8px 0 16px; }
+.muted, .section-description { color: var(--cp-text-muted); }
+.card { margin: 24px 0; padding: 24px; border: 1px solid var(--cp-border); border-radius: 16px; background: var(--cp-surface); }
+.table-scroll { overflow-x: auto; border: 1px solid var(--cp-border); border-radius: .625rem; }
+table { border-collapse: separate; border-spacing: 0; width: 100%; font-size: 13px; }
+.instance-table { min-width: 1560px; }
+.instance-table th { overflow-wrap: normal; white-space: nowrap; }
+th, td { padding: 16px; text-align: left; vertical-align: top; border-bottom: 1px solid var(--cp-border); overflow-wrap: anywhere; }
+th { background: var(--cp-surface-soft); color: var(--cp-text-muted); font-weight: 600; }
+thead tr:first-child th { vertical-align: middle; }
+tbody tr:last-child td { border-bottom: 0; }
+.instance-table td:first-child { font-weight: 600; }
+.section-db { background: var(--cp-accent-soft); }
+.section-mi { background: var(--cp-bg-elevated); }
+.section-iaas { background: var(--cp-surface-soft); }
+.group-start { border-left: 3px solid var(--cp-border-strong); }
+th.target-heading { color: var(--cp-text); font-size: 14px; padding-top: 20px; padding-bottom: 20px; }
+th.section-db.target-heading { color: var(--cp-accent); }
+.status { display: inline-flex; align-items: center; gap: 8px; white-space: nowrap; font-weight: 650; }
+.ready { color: var(--cp-success); }
+.not-ready { color: var(--cp-danger); }
+a { color: var(--cp-link); text-underline-offset: 3px; }
+a:hover { text-decoration-thickness: 2px; }
+.status-link { color: inherit; }
+.status-link .status { text-decoration: underline; text-underline-offset: 3px; }
+a:focus-visible, .table-scroll:focus-visible { outline: 2px solid var(--cp-accent); outline-offset: 2px; }
+.note { padding: 16px 20px; border: 1px solid var(--cp-border); border-left: 4px solid var(--cp-warning); border-radius: .625rem; background: var(--cp-bg-elevated); color: var(--cp-text-muted); }
+@media (max-width: 768px) { body { padding: 16px; } .card { padding: 16px; } h1 { font-size: 26px; } }
+@media print { body { padding: 0; } .card { padding: 12px; } .table-scroll { overflow: visible; } .instance-table { min-width: 0; } th, td { padding: 4px; font-size: 10px; } }
+</style></head><body><main>
+<header>
+<div class='eyebrow'>Migration readiness report</div>
 <h1>Azure SQL Migration Assessment Summary</h1>
-<p>Generated $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss zzz')</p>
+<p class='muted'>Generated $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss zzz') &middot; $(@($instanceSummary).Count) source instances</p>
+</header>
 <div class='note'>Validate compatibility findings before accepting a SKU. Performance sizing does not resolve feature blockers, cross-database dependencies, latency requirements, or operational constraints.</div>
+<section class='card'>
 <h2>Instance compatibility and SKU recommendations</h2>
+<p class='section-description'>Compare migration targets side by side. Select Ready or Not Ready to view the underlying assessment (HTML when available, otherwise JSON), or select a SKU recommendation to open its available report.</p>
 $instanceTable
-<h2>SKU recommendations</h2>
-$($recommendations | ConvertTo-Html -Fragment)
-<h2>Output inventory</h2>
-$($catalog | ConvertTo-Html -Fragment)
-</body></html>
+<p class='muted'>Warnings counts databases that are Ready for the target but have one or more warning findings. A zero does not mean the target is assessed or free of compatibility blockers. Not Assessed has no assessment link.</p>
+</section>
+</main></body></html>
 "@
-$html | Set-Content (Join-Path $SummaryFolder 'assessment-summary.html')
+$html | Set-Content (Join-Path $SummaryFolder 'assessment-summary.html') -Encoding UTF8
 Write-Host "Summary written to $SummaryFolder"
 Write-Host 'Open assessment-summary.html and review the CSV files for detailed filtering.'
