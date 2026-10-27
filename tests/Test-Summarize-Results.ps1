@@ -84,7 +84,7 @@ try {
     '<!doctype html><title>Unused assessment fixture</title>' |
         Set-Content (Join-Path $notAssessed 'SqlAssessment.html')
 
-    & $scriptPath -ResultsRoot $results -SummaryFolder $summary
+    & $scriptPath -ResultsRoot $results -SummaryFolder $summary -SkipPricing
     $html = Get-Content (Join-Path $summary 'assessment-summary.html') -Raw -Encoding UTF8
     $tableMarkup = [regex]::Match($html, "(?s)<table class='instance-table'>.*?</table>").Value
     Assert-True (-not [string]::IsNullOrWhiteSpace($tableMarkup)) 'Instance table is generated'
@@ -93,17 +93,20 @@ try {
     Assert-True ($headerRows.Count -eq 2) 'Two-tier column headers'
     $identityHeaders = @($headerRows[0].th | Where-Object rowspan -eq '2')
     Assert-True (($identityHeaders.InnerText -join '|') -eq 'Display Name|Server|Instance|Databases') 'Original identity columns preserved'
-    $groupHeaders = @($headerRows[0].th | Where-Object colspan -eq '3')
+    $groupHeaders = @($headerRows[0].th | Where-Object colspan -eq '4')
     Assert-True (($groupHeaders.InnerText -join '|') -eq 'Azure SQL Database|Azure SQL Managed Instance|SQL Server on Azure VM') 'Three named target groups'
     Assert-True (@($groupHeaders | Where-Object { $_.scope -eq 'colgroup' -and $_.class -match 'group-start' }).Count -eq 3) 'Accessible, separated groups'
-    Assert-True (($headerRows[1].th.InnerText -join '|') -eq (('Compatibility|Warnings|SKU Recommendation') + '|Compatibility|Warnings|SKU Recommendation|Compatibility|Warnings|SKU Recommendation')) 'Identical target subcolumns'
+    Assert-True (($headerRows[1].th.InnerText -join '|') -eq ((1..3 | ForEach-Object { 'Compatibility|Warnings|SKU Recommendation|Estimated cost/month' }) -join '|')) 'Identical target subcolumns'
 
     $rows = @($table.table.tbody.tr)
     Assert-True ($rows.Count -eq 3) 'One row per source instance'
     foreach ($row in $rows) {
-        Assert-True (@($row.td).Count -eq 13) 'Every row has 13 columns'
-        foreach ($column in @(4, 7, 10)) {
+        Assert-True (@($row.td).Count -eq 16) 'Every row has 16 columns'
+        foreach ($column in @(4, 8, 12)) {
             Assert-True ($row.td[$column].class -match 'group-start') 'Group boundaries align with headers'
+        }
+        foreach ($column in @(7, 11, 15)) {
+            Assert-True ($row.td[$column].InnerText -eq '' -and $row.td[$column].HasAttribute('data-pricing-key')) 'Monthly cost starts blank with a pricing key'
         }
     }
     $primaryRow = $rows | Where-Object { $_.SelectSingleNode('td[1]').InnerText -eq 'Finance & <Primary>' }
@@ -111,29 +114,29 @@ try {
     $primaryCells = $primaryRow.SelectNodes('td')
     Assert-True ($primaryCells[1].InnerText -eq 'demo-sql' -and $primaryCells[2].InnerText -eq 'ERP' -and $primaryCells[3].InnerText -eq '3') 'Identity and database values preserved'
     Assert-True ($primaryCells[4].a.span.class -eq 'status ready' -and $primaryCells[4].a.span.span.InnerText -eq [string][char]0x2713) 'Ready has a check mark and success styling'
-    Assert-True ($primaryCells[7].a.span.class -eq 'status not-ready' -and $primaryCells[7].a.span.InnerText -eq 'XNot Ready') 'NotReady is normalized, red, and marked X'
-    foreach ($column in @(4, 7)) {
+    Assert-True ($primaryCells[8].a.span.class -eq 'status not-ready' -and $primaryCells[8].a.span.InnerText -eq 'XNot Ready') 'NotReady is normalized, red, and marked X'
+    foreach ($column in @(4, 8)) {
         Assert-True ($primaryCells[$column].a.href -like '*demo-assessment.html') 'Ready and Not Ready link to the matching HTML assessment regardless of filename pattern'
     }
-    Assert-True ($primaryCells[10].span.InnerText -eq 'XNot Assessed' -and $null -eq $primaryCells[10].a) 'Missing target is red with X and no link'
-    foreach ($column in @(5, 8, 11)) {
+    Assert-True ($primaryCells[12].span.InnerText -eq 'XNot Assessed' -and $null -eq $primaryCells[12].a) 'Missing target is red with X and no link'
+    foreach ($column in @(5, 9, 13)) {
         Assert-True ($primaryCells[$column].InnerText -eq '1') 'Warnings count ready databases, not individual findings or blocked databases'
     }
     for ($i = 0; $i -lt $targets.Count; $i++) {
-        $cell = $primaryCells[6 + 3 * $i]
+        $cell = $primaryCells[6 + 4 * $i]
         Assert-True ($cell.a.InnerText -eq $skuNames[$i]) 'Correct SKU in each group with safe HTML encoding'
     }
     $allUnassessed = $rows | Where-Object { $_.SelectSingleNode('td[1]').InnerText -eq 'demo-not-assessed' }
-    foreach ($column in @(4, 7, 10)) {
+    foreach ($column in @(4, 8, 12)) {
         Assert-True ($allUnassessed.td[$column].span.InnerText -eq 'XNot Assessed' -and $null -eq $allUnassessed.td[$column].a) 'Explicit Not Assessed variants never link'
     }
     $noLinks = $rows | Where-Object { $_.SelectSingleNode('td[1]').InnerText -eq 'demo-no-links' }
-    foreach ($column in @(4, 7, 10)) {
+    foreach ($column in @(4, 8, 12)) {
         Assert-True ($noLinks.td[$column].a.href -like '*without-html/SqlAssessment.json') 'JSON-only assessments still provide underlying assessment links'
     }
     Assert-True ($noLinks.td[4].a.span.class -eq 'status ready') 'JSON-linked Ready is still green'
-    Assert-True ($noLinks.td[7].a.span.InnerText -eq 'XNot Ready') 'Spaced Not Ready is normalized'
-    Assert-True ($noLinks.td[10].a.span.InnerText -eq 'XUnknown') 'Unknown is not presented as Ready'
+    Assert-True ($noLinks.td[8].a.span.InnerText -eq 'XNot Ready') 'Spaced Not Ready is normalized'
+    Assert-True ($noLinks.td[12].a.span.InnerText -eq 'XUnknown') 'Unknown is not presented as Ready'
     Assert-True ($noLinks.td[6].InnerText -eq 'Not available') 'Missing SKU is explicit'
     foreach ($link in $table.SelectNodes('//a')) {
         Assert-True ($link.href -notmatch '^(?:[\\/]|[A-Za-z][A-Za-z0-9+.-]*:)') 'All assessment and SKU links are relative, not rooted paths or absolute URIs'
@@ -184,17 +187,17 @@ try {
     $emptySummary = Join-Path $testRoot 'new-parent\nested-summary'
     New-Item -ItemType Directory -Path $emptyResults | Out-Null
     Assert-True (-not (Test-Path -LiteralPath (Split-Path $emptySummary -Parent))) 'Summary parent does not exist before generation'
-    & $scriptPath -ResultsRoot $emptyResults -SummaryFolder $emptySummary
+    & $scriptPath -ResultsRoot $emptyResults -SummaryFolder $emptySummary -SkipPricing
     Assert-True (Test-Path -LiteralPath $emptySummary -PathType Container) 'Missing summary folder and parents are created'
     $emptyHtml = Get-Content (Join-Path $emptySummary 'assessment-summary.html') -Raw
     Assert-True ($emptyHtml -match 'No compatibility assessment reports were found' -and $emptyHtml -match '0 source instances') 'Empty results show a clear empty state'
     $markerPath = Join-Path $emptySummary 'existing-file.txt'
     'Preserve existing contents' | Set-Content -LiteralPath $markerPath
-    & $scriptPath -ResultsRoot $emptyResults -SummaryFolder $emptySummary
+    & $scriptPath -ResultsRoot $emptyResults -SummaryFolder $emptySummary -SkipPricing
     Assert-True ((Get-Content -LiteralPath $markerPath) -eq 'Preserve existing contents') 'Existing summary folder is reused without deleting unrelated files'
     $folderError = $null
     try {
-        & $scriptPath -ResultsRoot $emptyResults -SummaryFolder $markerPath
+        & $scriptPath -ResultsRoot $emptyResults -SummaryFolder $markerPath -SkipPricing
     } catch {
         $folderError = $_
     }

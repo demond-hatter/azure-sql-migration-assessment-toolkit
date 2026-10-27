@@ -1,9 +1,12 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory)][string]$ResultsRoot,
-    [string]$SummaryFolder = (Join-Path $ResultsRoot -ChildPath 'summary')
+    [string]$SummaryFolder = (Join-Path $ResultsRoot -ChildPath 'summary'),
+    [ValidatePattern('^[a-zA-Z0-9]+$')][string[]]$PricingRegion = @(),
+    [switch]$SkipPricing
 )
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'SummaryPricing.ps1')
 if (-not (Test-Path $ResultsRoot)) { throw "Results folder not found: $ResultsRoot" }
 $ResultsRoot = (Resolve-Path $ResultsRoot).Path
 if (-not (Test-Path -LiteralPath $SummaryFolder)) {
@@ -235,6 +238,18 @@ $instanceSummary = foreach ($assessment in $assessmentRecords |
 }
 $instanceSummary | Export-Csv (Join-Path $SummaryFolder 'instance-assessment-summary.csv') -NoTypeInformation
 
+$pricingRecommendations = @(
+    foreach ($row in $instanceSummary) {
+        [pscustomobject]@{ Target='AzureSqlDatabase'; Recommendation=$row.AzureSqlDatabaseSkuRecommendation }
+        [pscustomobject]@{ Target='AzureSqlManagedInstance'; Recommendation=$row.AzureSqlManagedInstanceSkuRecommendation }
+        [pscustomobject]@{ Target='AzureSqlVirtualMachine'; Recommendation=$row.AzureSqlIaaSSkuRecommendation }
+    }
+)
+$pricingSnapshot = New-SummaryPricingSnapshot -Recommendations $pricingRecommendations -Regions $PricingRegion -SkipPricing:$SkipPricing
+Export-SummaryPricingCsv -Instances @($instanceSummary) -Snapshot $pricingSnapshot -Regions $PricingRegion -Path (Join-Path $SummaryFolder 'pricing-options.csv')
+$pricingJson = ($pricingSnapshot | ConvertTo-Json -Depth 12 -Compress).Replace('<', '\u003c').Replace('>', '\u003e').Replace('&', '\u0026')
+$pricingScript = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'summary-pricing.js') -Raw
+
 $assessmentHints = $jsonRows | Where-Object { $_.Path -match '(?i)issue|warning|readiness|recommend|target|severity|category|message' }
 $assessmentHints | Export-Csv (Join-Path $SummaryFolder 'assessment-findings-filtered.csv') -NoTypeInformation
 
@@ -273,6 +288,11 @@ function Get-RecommendationCell {
     return "<td class='$SectionClass'><a href='$(ConvertTo-HtmlText $DetailsLink)'>$encodedRecommendation</a></td>"
 }
 
+function Get-CostCell {
+    param([string]$Target, [string]$Recommendation, [string]$SectionClass)
+    return "<td class='$SectionClass cost-cell' data-pricing-key='$(ConvertTo-HtmlText "$Target|$Recommendation")'></td>"
+}
+
 $instanceRows = foreach ($row in $instanceSummary) {
     @"
 <tr>
@@ -283,12 +303,15 @@ $instanceRows = foreach ($row in $instanceSummary) {
 $(Get-CompatibilityCell $row.AzureSqlDatabaseCompatibility $row.AzureSqlDatabaseDetails 'section-db')
 <td class='section-db'>$(ConvertTo-HtmlText $row.AzureSqlDatabaseReadyWithWarnings)</td>
 $(Get-RecommendationCell $row.AzureSqlDatabaseSkuRecommendation $row.AzureSqlDatabaseSkuDetails 'section-db')
+$(Get-CostCell 'AzureSqlDatabase' $row.AzureSqlDatabaseSkuRecommendation 'section-db')
 $(Get-CompatibilityCell $row.AzureSqlManagedInstanceCompatibility $row.AzureSqlManagedInstanceDetails 'section-mi')
 <td class='section-mi'>$(ConvertTo-HtmlText $row.AzureSqlManagedInstanceReadyWithWarnings)</td>
 $(Get-RecommendationCell $row.AzureSqlManagedInstanceSkuRecommendation $row.AzureSqlManagedInstanceSkuDetails 'section-mi')
+$(Get-CostCell 'AzureSqlManagedInstance' $row.AzureSqlManagedInstanceSkuRecommendation 'section-mi')
 $(Get-CompatibilityCell $row.AzureSqlIaaSCompatibility $row.AzureSqlIaaSDetails 'section-iaas')
 <td class='section-iaas'>$(ConvertTo-HtmlText $row.AzureSqlIaaSReadyWithWarnings)</td>
 $(Get-RecommendationCell $row.AzureSqlIaaSSkuRecommendation $row.AzureSqlIaaSSkuDetails 'section-iaas')
+$(Get-CostCell 'AzureSqlVirtualMachine' $row.AzureSqlIaaSSkuRecommendation 'section-iaas')
 </tr>
 "@
 }
@@ -299,14 +322,17 @@ $instanceTable = if (@($instanceSummary).Count -gt 0) {
 <thead>
 <tr>
 <th rowspan='2' scope='col'>Display Name</th><th rowspan='2' scope='col'>Server</th><th rowspan='2' scope='col'>Instance</th><th rowspan='2' scope='col'>Databases</th>
-<th colspan='3' scope='colgroup' class='section-db group-start target-heading'>Azure SQL Database</th>
-<th colspan='3' scope='colgroup' class='section-mi group-start target-heading'>Azure SQL Managed Instance</th>
-<th colspan='3' scope='colgroup' class='section-iaas group-start target-heading'>SQL Server on Azure VM</th>
+<th colspan='4' scope='colgroup' class='section-db group-start target-heading'>Azure SQL Database</th>
+<th colspan='4' scope='colgroup' class='section-mi group-start target-heading'>Azure SQL Managed Instance</th>
+<th colspan='4' scope='colgroup' class='section-iaas group-start target-heading'>SQL Server on Azure VM</th>
 </tr>
 <tr>
 <th scope='col' class='section-db group-start'>Compatibility</th><th scope='col' class='section-db'>Warnings</th><th scope='col' class='section-db'>SKU Recommendation</th>
+<th scope='col' class='section-db'>Estimated cost/month</th>
 <th scope='col' class='section-mi group-start'>Compatibility</th><th scope='col' class='section-mi'>Warnings</th><th scope='col' class='section-mi'>SKU Recommendation</th>
+<th scope='col' class='section-mi'>Estimated cost/month</th>
 <th scope='col' class='section-iaas group-start'>Compatibility</th><th scope='col' class='section-iaas'>Warnings</th><th scope='col' class='section-iaas'>SKU Recommendation</th>
+<th scope='col' class='section-iaas'>Estimated cost/month</th>
 </tr>
 </thead><tbody>$($instanceRows -join [Environment]::NewLine)</tbody>
 </table>
@@ -391,7 +417,7 @@ p { margin: 8px 0 16px; }
 .card { margin: 24px 0; padding: 24px; border: 1px solid var(--cp-border); border-radius: 16px; background: var(--cp-surface); }
 .table-scroll { overflow-x: auto; border: 1px solid var(--cp-border); border-radius: .625rem; }
 table { border-collapse: separate; border-spacing: 0; width: 100%; font-size: 13px; }
-.instance-table { min-width: 1560px; }
+.instance-table { min-width: 2040px; }
 .instance-table th { overflow-wrap: normal; white-space: nowrap; }
 th, td { padding: 16px; text-align: left; vertical-align: top; border-bottom: 1px solid var(--cp-border); overflow-wrap: anywhere; }
 th { background: var(--cp-surface-soft); color: var(--cp-text-muted); font-weight: 600; }
@@ -411,6 +437,19 @@ a { color: var(--cp-link); text-underline-offset: 3px; }
 a:hover { text-decoration-thickness: 2px; }
 .status-link { color: inherit; }
 .status-link .status { text-decoration: underline; text-underline-offset: 3px; }
+.pricing-controls { display: flex; flex-wrap: wrap; gap: 16px 24px; margin: 16px 0; align-items: end; }
+.pricing-field { display: flex; flex-direction: column; gap: 8px; font-weight: 600; }
+.pricing-check { display: flex; gap: 8px; align-items: center; }
+.pricing-controls select { padding: 8px 12px; border: 1px solid var(--cp-border-strong); border-radius: .625rem; background: var(--cp-surface); color: var(--cp-text); font: inherit; max-width: 100%; }
+.pricing-controls input { accent-color: var(--cp-accent); }
+.pricing-controls [hidden] { display: none; }
+.cost-value { font-weight: 650; white-space: nowrap; }
+.cost-scope { display: block; color: var(--cp-text-muted); margin-top: 4px; }
+.cost-unavailable { color: var(--cp-danger); }
+.cost-cell details { margin-top: 8px; min-width: 156px; font-size: 12px; color: var(--cp-text-muted); }
+.cost-cell summary { cursor: pointer; color: var(--cp-link); }
+.cost-cell ul { padding-left: 16px; }
+.cost-cell li { margin-bottom: 8px; }
 a:focus-visible, .table-scroll:focus-visible { outline: 2px solid var(--cp-accent); outline-offset: 2px; }
 .note { padding: 16px 20px; border: 1px solid var(--cp-border); border-left: 4px solid var(--cp-warning); border-radius: .625rem; background: var(--cp-bg-elevated); color: var(--cp-text-muted); }
 @media (max-width: 768px) { body { padding: 16px; } .card { padding: 16px; } h1 { font-size: 26px; } }
@@ -422,12 +461,30 @@ a:focus-visible, .table-scroll:focus-visible { outline: 2px solid var(--cp-accen
 <p class='muted'>Generated $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss zzz') &middot; $(@($instanceSummary).Count) source instances</p>
 </header>
 <div class='note'>Validate compatibility findings before accepting a SKU. Performance sizing does not resolve feature blockers, cross-database dependencies, latency requirements, or operational constraints.</div>
+<section class='card' aria-labelledby='pricing-heading'>
+<h2 id='pricing-heading'>Cost estimate settings</h2>
+<p class='section-description'>Offline retail estimates for each displayed recommended resource, not a total for all databases. Choose a region to populate costs; PAYG applies unless a commitment option is selected. Discounts apply only to eligible compute, not SQL licensing or storage.</p>
+<div class='pricing-controls'>
+<label class='pricing-field'>Azure region<select id='pricing-region'><option value=''>Select a region</option></select></label>
+<label class='pricing-field'>Pricing option<select id='pricing-plan'><option value='payg'>Pay as you go</option><option value='ri1'>1-year reserved instance</option><option value='ri3'>3-year reserved instance</option><option value='dbsp1'>1-year database savings plan</option></select></label>
+<label class='pricing-check'><input type='checkbox' id='pricing-ahb'>Use Azure Hybrid Benefit for eligible SQL licenses</label>
+<label class='pricing-check' id='pricing-gen5-field'><input type='checkbox' id='pricing-gen5'>Use Standard-series (Gen5) when SQL hardware is unspecified</label>
+<div id='pricing-vm-fields' class='pricing-controls'>
+<label class='pricing-field'>VM OS when unspecified<select id='pricing-vm-os'><option value=''>Select OS</option><option value='Windows'>Windows Server</option><option value='Linux'>Linux (no paid distribution license)</option></select></label>
+<label class='pricing-field'>VM SQL edition when unspecified<select id='pricing-vm-edition'><option value=''>Select edition</option><option value='Standard'>Standard</option><option value='Enterprise'>Enterprise</option><option value='Web'>Web</option></select></label>
+</div>
+</div>
+<p class='muted' id='pricing-status' role='status' aria-live='polite'></p>
+<p class='muted'><a href='pricing-options.csv'>Pricing options CSV for Ready targets</a>: generated for the command-line pricing regions (or available snapshot regions). Browser selections do not change this file.</p>
+</section>
 <section class='card'>
 <h2>Instance compatibility and SKU recommendations</h2>
 <p class='section-description'>Compare migration targets side by side. Select Ready or Not Ready to view the underlying assessment (HTML when available, otherwise JSON), or select a SKU recommendation to open its available report.</p>
 $instanceTable
 <p class='muted'>Warnings counts databases that are Ready for the target but have one or more warning findings. A zero does not mean the target is assessed or free of compatibility blockers. Not Assessed has no assessment link.</p>
 </section>
+<script type='application/json' id='pricing-data'>$pricingJson</script>
+<script>$pricingScript</script>
 </main></body></html>
 "@
 $html | Set-Content (Join-Path $SummaryFolder 'assessment-summary.html') -Encoding UTF8

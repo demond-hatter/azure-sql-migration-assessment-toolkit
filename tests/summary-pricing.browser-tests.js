@@ -1,0 +1,75 @@
+(() => {
+    "use strict";
+    const { estimate, specs, snapshot } = window.AzureSqlPricing;
+    let count = 0;
+    const check = (condition, message) => { count++; if (!condition) throw new Error(message); };
+    const close = (result, expected, message) => check(!result.error && Math.abs(result.amount - expected) < .00001, message + ": " + JSON.stringify(result));
+    const sql = [...specs.values()].find(spec => spec.target === "AzureSqlDatabase" && spec.cores === 4);
+    const mi = [...specs.values()].find(spec => spec.target === "AzureSqlManagedInstance" && spec.cores === 8);
+    const vm = [...specs.values()].find(spec => spec.target === "AzureSqlVirtualMachine" && spec.armSku);
+    const unspecified = [...specs.values()].find(spec => spec.needsHardware);
+    const defaults = { region: "eastus", plan: "payg", ahb: false, assumeGen5: false, vmOs: "", vmEdition: "" };
+    const cost = (spec, options = {}) => estimate(spec, { ...defaults, ...options });
+    try {
+        check([...document.querySelectorAll("[data-pricing-key]")].every(cell => cell.textContent === ""), "All cost cells must start blank");
+        check(document.getElementById("pricing-plan").value === "payg", "PAYG is the default");
+        close(cost(sql), 888, "SQL PAYG includes compute, license and storage");
+        close(cost(sql, { plan: "ri1" }), 704, "1-year RI is amortized over 12 months, license and storage unchanged");
+        close(cost(sql, { plan: "ri3" }), 2400 * 4 / 36 + 292 + 12, "3-year RI is amortized over 36 months");
+        close(cost(sql, { plan: "dbsp1" }), 742, "1-year database savings plan discounts compute only");
+        close(cost(sql, { ahb: true }), 596, "AHB waives only SQL licensing");
+        close(cost(sql, { plan: "ri1", ahb: true }), 412, "RI and AHB combine without discounting storage");
+        close(cost(sql, { plan: "dbsp1", ahb: true }), 450, "Database savings plan and AHB combine");
+        close(cost(mi), 8 * .3 * 730 + 256 * .12, "MI includes correct vCore and storage quantities");
+        check(!!cost(unspecified).error, "Unspecified hardware is never silently assumed");
+        close(cost(unspecified, { assumeGen5: true }), 2 * .3 * 730 + 11 * .12, "Explicit Gen5 selection resolves missing hardware");
+        close(cost(vm), 1365, "Windows VM includes SQL license and two disks");
+        close(cost(vm, { ahb: true }), 781, "VM AHB keeps Windows license and disks");
+        close(cost(vm, { plan: "ri1" }), 1173, "VM RI leaves Windows and SQL licensing undiscounted");
+        close(cost(vm, { plan: "ri3" }), 2400 / 36 + 219 + 584 + 270, "VM 3-year RI amortization");
+        check(!!cost(vm, { plan: "dbsp1" }).error, "Database savings plan is not applied to VM compute");
+        close(cost({ ...vm, os: "Linux" }), 1146, "Linux VM excludes Windows licensing");
+        check(!!cost({ ...vm, edition: "", os: "" }).error, "VM OS is not guessed");
+        close(cost({ ...vm, edition: "", os: "" }, { vmOs: "Windows", vmEdition: "Standard" }), 1365, "Missing VM details can be supplied explicitly");
+        check(!!cost(sql, { region: "missing-region" }).error, "Missing regional price never falls back to another region");
+
+        const compute = snapshot.items.find(item => item.productName === sql.computeProduct && item.type === "Consumption");
+        const duplicate = { ...compute, meterId: "ambiguous-meter", retailPrice: 99 };
+        snapshot.items.push(duplicate);
+        check(!!cost(sql).error, "Ambiguous prices are not guessed");
+        snapshot.items.pop();
+        const savings = compute.savingsPlan;
+        const originalPlans = snapshot.items.filter(item => item.productName === sql.computeProduct && item.type === "Consumption").map(item => [item, item.savingsPlan]);
+        for (const [item] of originalPlans) item.savingsPlan = [];
+        check(!!cost(sql, { plan: "dbsp1" }).error, "Missing savings-plan rate is not substituted with PAYG");
+        for (const [item, plans] of originalPlans) item.savingsPlan = plans;
+        check(savings.length > 0, "Fixture contains a published savings-plan field");
+        const noStorage = cost({ ...sql, storageGb: null });
+        close(noStorage, 876, "Unspecified storage produces a clearly qualified subtotal");
+        check(noStorage.notes.some(note => note.includes("storage is excluded")), "Storage exclusion is visible");
+
+        const region = document.getElementById("pricing-region");
+        region.value = "eastus";
+        region.dispatchEvent(new Event("change"));
+        const cell = [...document.querySelectorAll("[data-pricing-key]")].find(element => element.dataset.pricingKey === sql.key);
+        check(cell.querySelector(".cost-value").textContent === "$888.00", "Region selection populates costs offline");
+        const plan = document.getElementById("pricing-plan");
+        plan.value = "ri1";
+        plan.dispatchEvent(new Event("change"));
+        check(cell.querySelector(".cost-value").textContent === "$704.00", "Discount selection refreshes costs");
+        const ahb = document.getElementById("pricing-ahb");
+        ahb.checked = true;
+        ahb.dispatchEvent(new Event("change"));
+        check(cell.querySelector(".cost-value").textContent === "$412.00", "AHB selection refreshes costs");
+        check(cell.querySelector("details").textContent.includes("meter"), "Cost breakdown includes source meters");
+        region.value = "";
+        region.dispatchEvent(new Event("change"));
+        check([...document.querySelectorAll("[data-pricing-key]")].every(element => element.textContent === ""), "Clearing region clears stale estimates");
+        document.body.dataset.pricingTests = "passed";
+        document.body.dataset.pricingAssertions = String(count);
+    } catch (error) {
+        document.body.dataset.pricingTests = "failed";
+        document.body.dataset.pricingTestError = error.message;
+        throw error;
+    }
+})();
