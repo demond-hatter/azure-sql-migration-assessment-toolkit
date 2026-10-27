@@ -183,6 +183,115 @@ try {
         }
     }
 
+    $vmResults = Join-Path $testRoot 'vm-results'
+    $vmSummary = Join-Path $testRoot 'vm-summary'
+    $vmCases = @(
+        @{ name='clean'; expected='Ready'; warnings=0 }
+        @{ name='warning-only'; expected='Ready'; warnings=1 }
+        @{ name='native-alias'; expected='Ready'; warnings=1 }
+        @{ name='iaas-alias'; expected='NotReady'; warnings=0 }
+        @{ name='explicit-not-ready'; expected='NotReady'; warnings=0 }
+        @{ name='explicit-not-assessed'; expected='Not assessed'; warnings=0 }
+        @{ name='explicit-unknown'; expected='Unknown'; warnings=0 }
+        @{ name='server-warning'; expected='Ready'; warnings=0 }
+        @{ name='database-issue'; expected='NotReady'; warnings=0 }
+        @{ name='database-blocking-issue'; expected='NotReady'; warnings=0 }
+        @{ name='database-critical'; expected='NotReady'; warnings=0 }
+        @{ name='server-blocker'; expected='NotReady'; warnings=0 }
+        @{ name='database-not-ready'; expected='NotReady'; warnings=0 }
+        @{ name='database-not-assessed'; expected='Not assessed'; warnings=0 }
+        @{ name='report-failed'; expected='Not assessed'; warnings=0 }
+        @{ name='server-failed'; expected='Not assessed'; warnings=0 }
+        @{ name='database-failed'; expected='Not assessed'; warnings=0 }
+        @{ name='database-failed-with-ready'; expected='Not assessed'; warnings=0 }
+        @{ name='report-errors'; expected='Not assessed'; warnings=0 }
+        @{ name='server-errors'; expected='Not assessed'; warnings=0 }
+        @{ name='database-errors'; expected='Not assessed'; warnings=0 }
+        @{ name='missing-status'; expected='Not assessed'; warnings=0 }
+        @{ name='empty-databases'; expected='Not assessed'; warnings=0 }
+    )
+    foreach ($case in $vmCases) {
+        $folder = Join-Path $vmResults $case.name
+        New-Item -ItemType Directory -Path $folder -Force | Out-Null
+        $database = @{
+            Status='Completed'; Errors=@(); DatabaseAssessments=@()
+            TargetReadinesses=@{ AzureSqlDatabase=(New-Readiness 'Ready') }
+        }
+        $server = @{
+            Status='Completed'; Errors=@(); ServerAssessments=@()
+            Properties=@{ServerName=$case.name; InstanceName='ERP'}
+            TargetReadinesses=@{AzureSqlDatabase=(New-Readiness 'NotReady'); AzureSqlManagedInstance=(New-Readiness 'NotReady')}
+            Databases=@($database)
+        }
+        $report = @{Status='Completed'; Errors=@(); Servers=@($server)}
+        $warning = @{IssueCategory='Warning'; AppliesToMigrationTargetPlatform='SqlServerOnAzureVM'}
+        switch ($case.name) {
+            'clean' { $database.DatabaseAssessments=@(@{IssueCategory='Issue'; AppliesToMigrationTargetPlatform='AzureSqlDatabase'}) }
+            'warning-only' { $database.DatabaseAssessments=@($warning, $warning) }
+            'native-alias' {
+                $server.TargetReadinesses.SqlServerOnAzureVM = New-Readiness 'Ready'
+                $database.TargetReadinesses.SqlServerOnAzureVM = New-Readiness 'Ready'
+                $database.DatabaseAssessments=@($warning, $warning)
+            }
+            'iaas-alias' { $server.TargetReadinesses.AzureSqlIaaS = New-Readiness 'NotReady' }
+            'explicit-not-ready' { $server.TargetReadinesses.AzureSqlVirtualMachine = New-Readiness 'NotReady' }
+            'explicit-not-assessed' { $server.TargetReadinesses.SqlServerOnAzureVM = New-Readiness 'NotAssessed' }
+            'explicit-unknown' { $server.TargetReadinesses.SqlServerOnAzureVM = New-Readiness '' }
+            'server-warning' { $server.ServerAssessments=@($warning) }
+            'database-issue' { $database.DatabaseAssessments=@(@{IssueCategory='Issue'; AppliesToMigrationTargetPlatform='SqlServerOnAzureVM'}) }
+            'database-blocking-issue' { $database.DatabaseAssessments=@(@{IssueCategory='BlockingIssue'; AppliesToMigrationTargetPlatform='AzureSqlIaaS'}) }
+            'database-critical' { $database.DatabaseAssessments=@(@{IssueCategory='Critical'; AppliesToMigrationTargetPlatform='AzureSqlVirtualMachine'}) }
+            'server-blocker' { $server.ServerAssessments=@(@{IssueCategory='Issue'; AppliesToMigrationTargetPlatform='SqlServerOnAzureVM'}) }
+            'database-not-ready' { $database.TargetReadinesses.SqlServerOnAzureVM = New-Readiness 'NotReady' }
+            'database-not-assessed' { $database.TargetReadinesses.SqlServerOnAzureVM = New-Readiness 'NotAssessed' }
+            'report-failed' { $report.Status='Failed' }
+            'server-failed' { $server.Status='Failed' }
+            'database-failed' { $database.Status='Failed' }
+            'database-failed-with-ready' {
+                $database.Status='Failed'
+                $database.TargetReadinesses.SqlServerOnAzureVM = New-Readiness 'Ready'
+            }
+            'report-errors' { $report.Errors=@('Synthetic report error') }
+            'server-errors' { $server.Errors=@('Synthetic server error') }
+            'database-errors' { $database.Errors=@('Synthetic database error') }
+            'missing-status' { $report.Remove('Status') }
+            'empty-databases' { $server.Databases=@() }
+        }
+        $report | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath (Join-Path $folder 'SqlAssessment.json') -Encoding UTF8
+        '<!doctype html><title>VM assessment fixture</title>' | Set-Content -LiteralPath (Join-Path $folder 'SqlAssessment.html')
+        "Instance name: $($case.name)\ERP`r`nSKU recommendation: SQL Server on Azure VM Standard_D8s_v5 Windows Standard Edition`r`nRecommendation reasons: Test" |
+            Set-Content -LiteralPath (Join-Path $folder 'vm-console.txt')
+    }
+    & $scriptPath -ResultsRoot $vmResults -SummaryFolder $vmSummary -SkipPricing -PricingRegion westus3
+    $vmCsv = @(Import-Csv -LiteralPath (Join-Path $vmSummary 'instance-assessment-summary.csv'))
+    $vmPricing = @(Import-Csv -LiteralPath (Join-Path $vmSummary 'pricing-options.csv'))
+    $vmHtml = Get-Content -LiteralPath (Join-Path $vmSummary 'assessment-summary.html') -Raw
+    [xml]$vmTable = [regex]::Match($vmHtml, "(?s)<table class='instance-table'>.*?</table>").Value
+    Assert-True ($vmCsv.Count -eq $vmCases.Count) 'All VM assessment fixtures appear in the summary'
+    Assert-True ($vmPricing.Count -eq @($vmCases | Where-Object expected -eq 'Ready').Count) 'Only explicit or inferred Ready VM targets qualify for the pricing CSV'
+    foreach ($case in $vmCases) {
+        $record = $vmCsv | Where-Object ServerName -eq $case.name
+        Assert-True ($record.AzureSqlIaaSCompatibility -eq $case.expected) "$($case.name): correct VM readiness"
+        Assert-True ($record.AzureSqlIaaSReadyWithWarnings -eq [string]$case.warnings) "$($case.name): correct warning database count"
+        Assert-True ($record.AzureSqlDatabaseCompatibility -eq 'NotReady' -and $record.AzureSqlManagedInstanceCompatibility -eq 'NotReady') 'VM fallback never changes SQL Database or Managed Instance statuses'
+        $row = $vmTable.table.tbody.tr | Where-Object { $_.SelectSingleNode('td[2]').InnerText -eq $case.name }
+        if ($case.expected -eq 'Not assessed') {
+            Assert-True (-not $record.AzureSqlIaaSDetails -and $null -eq $row.td[12].a) 'Unassessed VM targets never link'
+        } else {
+            Assert-True ($record.AzureSqlIaaSDetails -like '*SqlAssessment.html' -and $row.td[12].a.href) 'Assessed VM targets link to the source HTML'
+        }
+        if ($case.expected -eq 'Ready') {
+            Assert-True ($row.td[12].a.span.class -eq 'status ready') 'Ready VM targets display green rather than red'
+            $pricingRow = $vmPricing | Where-Object ServerName -eq $case.name
+            Assert-True ($pricingRow.ReadinessSource -eq $record.AzureSqlIaaSReadinessSource) 'Pricing CSV preserves explicit or inferred readiness provenance'
+        }
+    }
+    $inferred = $vmCsv | Where-Object ServerName -eq 'clean'
+    $native = $vmCsv | Where-Object ServerName -eq 'native-alias'
+    Assert-True ($inferred.AzureSqlIaaSReadinessSource -like 'Completed assessment VM fallback*' -and
+        $native.AzureSqlIaaSReadinessSource -eq 'Explicit JSON target readiness') 'Explicit and inferred VM readiness sources are distinguishable'
+    Assert-True ($vmHtml -match "title='Completed assessment VM fallback") 'HTML tooltip exposes the fallback source'
+
     $emptyResults = Join-Path $testRoot 'empty-results'
     $emptySummary = Join-Path $testRoot 'new-parent\nested-summary'
     New-Item -ItemType Directory -Path $emptyResults | Out-Null

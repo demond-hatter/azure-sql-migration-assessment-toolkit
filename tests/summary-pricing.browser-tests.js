@@ -8,7 +8,7 @@
     const mi = [...specs.values()].find(spec => spec.target === "AzureSqlManagedInstance" && spec.cores === 8);
     const vm = [...specs.values()].find(spec => spec.target === "AzureSqlVirtualMachine" && spec.armSku);
     const unspecified = [...specs.values()].find(spec => spec.needsHardware);
-    const defaults = { region: "eastus", plan: "payg", ahb: false, assumeGen5: false, vmOs: "", vmEdition: "" };
+    const defaults = { region: "eastus", plan: "payg", ahb: false, assumeGen5: false };
     const cost = (spec, options = {}) => estimate(spec, { ...defaults, ...options });
     try {
         check([...document.querySelectorAll("[data-pricing-key]")].every(cell => cell.textContent === ""), "All cost cells must start blank");
@@ -24,13 +24,29 @@
         check(!!cost(unspecified).error, "Unspecified hardware is never silently assumed");
         close(cost(unspecified, { assumeGen5: true }), 2 * .3 * 730 + 11 * .12, "Explicit Gen5 selection resolves missing hardware");
         close(cost(vm), 1365, "Windows VM includes SQL license and two disks");
+        check(vm.editionSource === "Source assessment ServerEdition" && vm.edition === "Standard", "VM edition comes from the source assessed server when absent from the recommendation");
+        check(!document.getElementById("pricing-vm-edition"), "Report has no SQL edition override selector");
+        check(!document.getElementById("pricing-vm-os"), "Report has no VM OS selector");
+        check(vm.os === "Windows" && vm.notes.some(note => note.includes("Windows Server assumed")), "Unspecified OS defaults to Windows Server with a disclosed assumption");
+        close(cost({ ...vm, edition: "Enterprise" }), 3117, "Enterprise source context uses its own license meter");
+        check(snapshot.items.some(item => item.armSkuName === vm.armSku && item.skuName === "D8s v5"), "VM fixture uses actual retail display SKU names");
+        check(snapshot.items.some(item => item.armSkuName === vm.armSku && /Spot|Low Priority/.test(item.skuName)), "Spot and Low Priority meters are excluded from standard VM arithmetic");
+        const retailItems = snapshot.items;
+        snapshot.items = snapshot.items.map(item => item.armSkuName === vm.armSku && item.skuName === "D8s v5" ? { ...item, skuName: vm.armSku } : item);
+        close(cost(vm), 1365, "Legacy ARM-form retail SKU names remain supported");
+        snapshot.items = retailItems;
+        const smallVm = { ...vm, armSku: "Standard_D2as_v4", cores: 2, disks: [] };
+        close(cost(smallVm), 438, "Small native VM uses the 1-4 vCPU SQL license meter");
+        close(cost(smallVm, { ahb: true }), 146, "Small VM AHB retains Windows licensing");
+        close(cost(smallVm, { plan: "ri1" }), 415, "Small VM reservation retains Windows and SQL licensing");
         close(cost(vm, { ahb: true }), 781, "VM AHB keeps Windows license and disks");
         close(cost(vm, { plan: "ri1" }), 1173, "VM RI leaves Windows and SQL licensing undiscounted");
         close(cost(vm, { plan: "ri3" }), 2400 / 36 + 219 + 584 + 270, "VM 3-year RI amortization");
         check(!!cost(vm, { plan: "dbsp1" }).error, "Database savings plan is not applied to VM compute");
         close(cost({ ...vm, os: "Linux" }), 1146, "Linux VM excludes Windows licensing");
-        check(!!cost({ ...vm, edition: "", os: "" }).error, "VM OS is not guessed");
-        close(cost({ ...vm, edition: "", os: "" }, { vmOs: "Windows", vmEdition: "Standard" }), 1365, "Missing VM details can be supplied explicitly");
+        close(cost({ ...vm, os: "" }), 1365, "Missing VM OS defaults to Windows, including Windows licensing");
+        close(cost({ ...vm, os: "" }, { vmOs: "Linux" }), 1365, "A removed browser override cannot replace the Windows default");
+        check(!!cost({ ...vm, edition: "" }, { vmEdition: "Standard" }).error, "Missing source SQL edition is not replaced by a global browser override");
         check(!!cost(sql, { region: "missing-region" }).error, "Missing regional price never falls back to another region");
 
         const compute = snapshot.items.find(item => item.productName === sql.computeProduct && item.type === "Consumption");

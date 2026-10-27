@@ -54,10 +54,14 @@
             const term = options.plan === "ri1" ? "1 Year" : options.plan === "ri3" ? "3 Years" : "";
             if (spec.target === "AzureSqlVirtualMachine") {
                 if (options.plan === "dbsp1") throw new Error("The database savings plan does not apply to SQL Server on Azure VMs. Choose PAYG or a reservation.");
-                const os = spec.os || options.vmOs;
-                if (!os) throw new Error("The VM OS is unspecified. Select a VM operating system.");
+                const os = spec.os || "Windows";
+                if (!spec.os) {
+                    const assumption = "VM OS unspecified; Windows Server assumed, including Windows Server licensing.";
+                    if (!notes.includes(assumption)) notes.push(assumption);
+                }
+                const vmSkuNames = [spec.armSku.toLowerCase(), spec.armSku.replace(/^Standard_/i, "").replace(/_/g, " ").toLowerCase()];
                 const exactVm = item => String(item.armSkuName || "").toLowerCase() === spec.armSku.toLowerCase() &&
-                    item.skuName.toLowerCase() === spec.armSku.toLowerCase();
+                    vmSkuNames.includes(item.skuName.toLowerCase());
                 const linux = item => exactVm(item) && !item.productName.endsWith(" Windows");
                 const windows = item => exactVm(item) && item.productName.endsWith(" Windows");
                 const base = meter(linux, options.region);
@@ -73,10 +77,11 @@
                     add("VM compute" + (os === "Windows" ? " and Windows Server license" : ""), monthly(compute), compute);
                 }
                 if (!options.ahb) {
-                    const edition = spec.edition || options.vmEdition;
-                    if (!edition) throw new Error("The SQL edition is unspecified. Select an edition for VM license pricing, or confirm eligible SQL Hybrid Benefit.");
+                    const edition = spec.edition;
+                    if (!edition) throw new Error(spec.editionError || "SQL edition is missing from the recommendation and source assessment.");
+                    const licenseSku = spec.cores <= 4 ? "1-4 vCPU VM" : spec.cores + " vCPU VM";
                     const sql = meter(item => item.productName.toLowerCase() === ("SQL Server " + edition).toLowerCase() &&
-                        item.skuName === Math.max(4, spec.cores) + " vCPU VM", "");
+                        item.skuName === licenseSku, "");
                     add("SQL Server " + edition + " license", monthly(sql), sql);
                 }
                 if (!spec.disks.length) notes.push("No managed-disk SKUs were specified; all VM storage is excluded.");
@@ -131,8 +136,6 @@
     const planSelect = document.getElementById("pricing-plan");
     const ahb = document.getElementById("pricing-ahb");
     const assumeGen5 = document.getElementById("pricing-gen5");
-    const vmOs = document.getElementById("pricing-vm-os");
-    const vmEdition = document.getElementById("pricing-vm-edition");
     const status = document.getElementById("pricing-status");
     const regionNames = new Map();
     for (const item of snapshot.items) {
@@ -149,7 +152,6 @@
         regionSelect.append(option);
     }
     document.getElementById("pricing-gen5-field").hidden = !snapshot.specs.some(spec => spec.needsHardware);
-    document.getElementById("pricing-vm-fields").hidden = !snapshot.specs.some(spec => spec.target === "AzureSqlVirtualMachine" && !spec.error);
     const baseStatus = snapshot.skipped ? "Pricing snapshot skipped. Regenerate without -SkipPricing to enable estimates." :
         "USD retail pricing snapshot: " + new Date(snapshot.generatedUtc).toLocaleString() + ". " +
         regionNames.size + " regions. " + hours + " hours/month. " +
@@ -168,7 +170,7 @@
             const spec = specs.get(cell.dataset.pricingKey);
             const result = spec ? estimate(spec, {
                 region: regionSelect.value, plan: planSelect.value, ahb: ahb.checked,
-                assumeGen5: assumeGen5.checked, vmOs: vmOs.value, vmEdition: vmEdition.value
+                assumeGen5: assumeGen5.checked
             }) : { amount: null, error: "No SKU recommendation.", notes: [], components: [] };
             const value = document.createElement("span");
             value.className = result.error ? "cost-unavailable" : "cost-value";
@@ -200,6 +202,6 @@
         }
         status.textContent = baseStatus + (regionSelect.value ? " Priced: " + priced + "; unavailable: " + unavailable + "." : "");
     }
-    for (const control of [regionSelect, planSelect, ahb, assumeGen5, vmOs, vmEdition]) control.addEventListener("change", render);
+    for (const control of [regionSelect, planSelect, ahb, assumeGen5]) control.addEventListener("change", render);
     window.AzureSqlPricing = { estimate, specs, snapshot };
 })();

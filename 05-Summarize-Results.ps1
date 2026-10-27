@@ -51,11 +51,57 @@ function Get-SourceMetadata {
     return $null
 }
 
+function Get-AssessmentTargetNames {
+    param([Parameter(Mandatory)][string]$Target)
+    if ($Target -eq 'AzureSqlVirtualMachine') {
+        return @('AzureSqlVirtualMachine', 'SqlServerOnAzureVM', 'AzureSqlIaaS')
+    }
+    return @($Target)
+}
+
+function Get-TargetReadiness {
+    param($Object, [Parameter(Mandatory)][string]$Target)
+    $targetReadinesses = Get-PropertyValue $Object 'TargetReadinesses'
+    foreach ($name in (Get-AssessmentTargetNames $Target)) {
+        $readiness = Get-PropertyValue $targetReadinesses $name
+        if ($null -ne $readiness) { return $readiness }
+    }
+    return $null
+}
+
+function Test-AssessmentCompleted {
+    param($Object)
+    return (Get-PropertyValue $Object 'Status') -eq 'Completed' -and
+        @(Get-PropertyValue $Object 'Errors' | Where-Object { $null -ne $_ }).Count -eq 0
+}
+
 function Get-ReadinessStatus {
-    param($Server, [Parameter(Mandatory)][string]$Target)
-    $targetReadinesses = Get-PropertyValue $Server 'TargetReadinesses'
-    $readiness = Get-PropertyValue $targetReadinesses $Target
-    if (-not $readiness) { return 'Not assessed' }
+    param($Server, [Parameter(Mandatory)][string]$Target, [switch]$CompletedAssessment)
+    $readiness = Get-TargetReadiness $Server $Target
+    if ($null -eq $readiness) {
+        if ($Target -ne 'AzureSqlVirtualMachine' -or -not $CompletedAssessment -or -not (Test-AssessmentCompleted $Server)) {
+            return 'Not assessed'
+        }
+        # Native VM reports omit readiness when no VM-specific issues exist.
+        if ($null -ne $Server.PSObject.Properties['Databases']) {
+            $databases = @(Get-PropertyValue $Server 'Databases' | Where-Object { $null -ne $_ })
+            if ($databases.Count -eq 0) { return 'Not assessed' }
+            if (@($databases | Where-Object { -not (Test-AssessmentCompleted $_) }).Count -gt 0) { return 'Not assessed' }
+            $statuses = @($databases | ForEach-Object {
+                Get-ReadinessStatus $_ $Target -CompletedAssessment
+            })
+            if (@($statuses | Where-Object { ($_ -replace '[\s_-]', '') -eq 'NotReady' }).Count -gt 0) { return 'NotReady' }
+            if (@($statuses | Where-Object { $_ -ne 'Ready' }).Count -gt 0) { return 'Not assessed' }
+        }
+        $targetNames = Get-AssessmentTargetNames $Target
+        $findings = @(Get-PropertyValue $Server 'ServerAssessments') + @(Get-PropertyValue $Server 'DatabaseAssessments')
+        $blockers = @($findings | Where-Object {
+            (Get-PropertyValue $_ 'AppliesToMigrationTargetPlatform') -in $targetNames -and
+            (Get-PropertyValue $_ 'IssueCategory') -in @('Issue', 'BlockingIssue', 'Critical')
+        })
+        if ($blockers.Count -gt 0) { return 'NotReady' }
+        return 'Ready'
+    }
     $status = [string](Get-PropertyValue $readiness 'RecommendationStatus')
     if ([string]::IsNullOrWhiteSpace($status)) { return 'Unknown' }
     if (($status -replace '[\s_-]', '') -eq 'NotAssessed') { return 'Not assessed' }
@@ -63,16 +109,15 @@ function Get-ReadinessStatus {
 }
 
 function Get-ReadyWithWarningsCount {
-    param($Server, [Parameter(Mandatory)][string]$Target)
+    param($Server, [Parameter(Mandatory)][string]$Target, [switch]$CompletedAssessment)
     $count = 0
+    $targetNames = Get-AssessmentTargetNames $Target
     foreach ($database in @(Get-PropertyValue $Server 'Databases')) {
         if ($null -eq $database) { continue }
-        $targetReadinesses = Get-PropertyValue $database 'TargetReadinesses'
-        $readiness = Get-PropertyValue $targetReadinesses $Target
-        if ([string](Get-PropertyValue $readiness 'RecommendationStatus') -ne 'Ready') { continue }
+        if ((Get-ReadinessStatus $database $Target -CompletedAssessment:$CompletedAssessment) -ne 'Ready') { continue }
         $warnings = @(Get-PropertyValue $database 'DatabaseAssessments' | Where-Object {
             [string](Get-PropertyValue $_ 'IssueCategory') -eq 'Warning' -and
-            [string](Get-PropertyValue $_ 'AppliesToMigrationTargetPlatform') -eq $Target
+            [string](Get-PropertyValue $_ 'AppliesToMigrationTargetPlatform') -in $targetNames
         })
         if ($warnings.Count -gt 0) { $count++ }
     }
@@ -164,6 +209,7 @@ $assessmentRecords = foreach ($file in $files | Where-Object Extension -eq '.jso
         if ($servers.Count -eq 0) { continue }
         $source = Get-SourceMetadata $file
         $htmlReport = Get-RelatedHtmlReport $file '*SqlAssessment*.html'
+        $completedReport = Test-AssessmentCompleted $report
         foreach ($server in $servers) {
             $properties = Get-PropertyValue $server 'Properties'
             $serverName = if ($source -and $source.ServerName) { [string]$source.ServerName } else { [string](Get-PropertyValue $properties 'ServerName') }
@@ -172,6 +218,15 @@ $assessmentRecords = foreach ($file in $files | Where-Object Extension -eq '.jso
             $displayName = if ($source -and $source.Name) { [string]$source.Name } else { $dataSource }
             $sourceToken = if ($source) { Split-Path $file.DirectoryName -Leaf } else { '' }
             $databases = @(Get-PropertyValue $server 'Databases' | Where-Object { $null -ne $_ })
+            $completedVmAssessment = $completedReport -and (Test-AssessmentCompleted $server)
+            $vmStatus = Get-ReadinessStatus $server 'AzureSqlVirtualMachine' -CompletedAssessment:$completedVmAssessment
+            $vmReadinessSource = if ($null -ne (Get-TargetReadiness $server 'AzureSqlVirtualMachine')) {
+                'Explicit JSON target readiness'
+            } elseif ($vmStatus -in @('Ready', 'NotReady')) {
+                'Completed assessment VM fallback (absent target readiness; database statuses and VM findings checked)'
+            } else {
+                'No complete VM readiness evidence'
+            }
             [pscustomobject]@{
                 Identity=Get-NormalizedIdentity $dataSource
                 DisplayName=$displayName
@@ -179,13 +234,15 @@ $assessmentRecords = foreach ($file in $files | Where-Object Extension -eq '.jso
                 InstanceName=$instanceName
                 DataSource=$dataSource
                 SourceToken=$sourceToken
+                SourceSqlEdition=[string](Get-PropertyValue $properties 'ServerEdition')
                 SqlDbStatus=Get-ReadinessStatus $server 'AzureSqlDatabase'
                 SqlMiStatus=Get-ReadinessStatus $server 'AzureSqlManagedInstance'
-                SqlVmStatus=Get-ReadinessStatus $server 'AzureSqlVirtualMachine'
+                SqlVmStatus=$vmStatus
+                SqlVmReadinessSource=$vmReadinessSource
                 NumberOfDatabases=$databases.Count
                 SqlDbReadyWithWarnings=Get-ReadyWithWarningsCount $server 'AzureSqlDatabase'
                 SqlMiReadyWithWarnings=Get-ReadyWithWarningsCount $server 'AzureSqlManagedInstance'
-                SqlVmReadyWithWarnings=Get-ReadyWithWarningsCount $server 'AzureSqlVirtualMachine'
+                SqlVmReadyWithWarnings=Get-ReadyWithWarningsCount $server 'AzureSqlVirtualMachine' -CompletedAssessment:$completedVmAssessment
                 AssessmentReport=Get-RelativeFileLink $file.FullName
                 AssessmentLink=if ($htmlReport) { Get-RelativeFileLink $htmlReport.FullName } else { Get-RelativeFileLink $file.FullName }
                 LastWriteTimeUtc=$file.LastWriteTimeUtc
@@ -218,6 +275,7 @@ $instanceSummary = foreach ($assessment in $assessmentRecords |
         InstanceName=$assessment.InstanceName
         DataSource=$assessment.DataSource
         NumberOfDatabases=$assessment.NumberOfDatabases
+        SourceSqlEdition=$assessment.SourceSqlEdition
         AzureSqlDatabaseCompatibility=$assessment.SqlDbStatus
         AzureSqlDatabaseReadyWithWarnings=$assessment.SqlDbReadyWithWarnings
         AzureSqlDatabaseDetails=if ($assessment.SqlDbStatus -ne 'Not assessed') { $assessment.AssessmentLink } else { '' }
@@ -229,6 +287,7 @@ $instanceSummary = foreach ($assessment in $assessmentRecords |
         AzureSqlManagedInstanceSkuRecommendation=if ($sqlMiRecommendation) { $sqlMiRecommendation.Recommendation } else { '' }
         AzureSqlManagedInstanceSkuDetails=if ($sqlMiRecommendation) { $sqlMiRecommendation.ReportLink } else { '' }
         AzureSqlIaaSCompatibility=$assessment.SqlVmStatus
+        AzureSqlIaaSReadinessSource=$assessment.SqlVmReadinessSource
         AzureSqlIaaSReadyWithWarnings=$assessment.SqlVmReadyWithWarnings
         AzureSqlIaaSDetails=if ($assessment.SqlVmStatus -ne 'Not assessed') { $assessment.AssessmentLink } else { '' }
         AzureSqlIaaSSkuRecommendation=if ($sqlVmRecommendation) { $sqlVmRecommendation.Recommendation } else { '' }
@@ -242,7 +301,7 @@ $pricingRecommendations = @(
     foreach ($row in $instanceSummary) {
         [pscustomobject]@{ Target='AzureSqlDatabase'; Recommendation=$row.AzureSqlDatabaseSkuRecommendation }
         [pscustomobject]@{ Target='AzureSqlManagedInstance'; Recommendation=$row.AzureSqlManagedInstanceSkuRecommendation }
-        [pscustomobject]@{ Target='AzureSqlVirtualMachine'; Recommendation=$row.AzureSqlIaaSSkuRecommendation }
+        [pscustomobject]@{ Target='AzureSqlVirtualMachine'; Recommendation=$row.AzureSqlIaaSSkuRecommendation; SourceSqlEdition=$row.SourceSqlEdition }
     }
 )
 $pricingSnapshot = New-SummaryPricingSnapshot -Recommendations $pricingRecommendations -Regions $PricingRegion -SkipPricing:$SkipPricing
@@ -259,7 +318,7 @@ function ConvertTo-HtmlText {
 }
 
 function Get-CompatibilityCell {
-    param([string]$Status, [string]$DetailsLink, [Parameter(Mandatory)][string]$SectionClass)
+    param([string]$Status, [string]$DetailsLink, [Parameter(Mandatory)][string]$SectionClass, [string]$StatusNote)
     $normalizedStatus = $Status -replace '[\s_-]', ''
     $displayStatus = switch ($normalizedStatus) {
         'Ready' { 'Ready' }
@@ -269,7 +328,8 @@ function Get-CompatibilityCell {
     }
     $statusClass = if ($normalizedStatus -eq 'Ready') { 'ready' } else { 'not-ready' }
     $icon = if ($normalizedStatus -eq 'Ready') { '&#10003;' } else { 'X' }
-    $badge = "<span class='status $statusClass'><span aria-hidden='true'>$icon</span>$(ConvertTo-HtmlText $displayStatus)</span>"
+    $noteAttribute = if ($StatusNote) { " title='$(ConvertTo-HtmlText $StatusNote)'" } else { '' }
+    $badge = "<span class='status $statusClass'$noteAttribute><span aria-hidden='true'>$icon</span>$(ConvertTo-HtmlText $displayStatus)</span>"
     if ($normalizedStatus -eq 'NotAssessed' -or [string]::IsNullOrWhiteSpace($DetailsLink)) {
         return "<td class='$SectionClass group-start'>$badge</td>"
     }
@@ -289,8 +349,9 @@ function Get-RecommendationCell {
 }
 
 function Get-CostCell {
-    param([string]$Target, [string]$Recommendation, [string]$SectionClass)
-    return "<td class='$SectionClass cost-cell' data-pricing-key='$(ConvertTo-HtmlText "$Target|$Recommendation")'></td>"
+    param([string]$Target, [string]$Recommendation, [string]$SectionClass, [string]$SourceSqlEdition)
+    $key = Get-SummaryPricingKey $Target $Recommendation $SourceSqlEdition
+    return "<td class='$SectionClass cost-cell' data-pricing-key='$(ConvertTo-HtmlText $key)'></td>"
 }
 
 $instanceRows = foreach ($row in $instanceSummary) {
@@ -308,10 +369,10 @@ $(Get-CompatibilityCell $row.AzureSqlManagedInstanceCompatibility $row.AzureSqlM
 <td class='section-mi'>$(ConvertTo-HtmlText $row.AzureSqlManagedInstanceReadyWithWarnings)</td>
 $(Get-RecommendationCell $row.AzureSqlManagedInstanceSkuRecommendation $row.AzureSqlManagedInstanceSkuDetails 'section-mi')
 $(Get-CostCell 'AzureSqlManagedInstance' $row.AzureSqlManagedInstanceSkuRecommendation 'section-mi')
-$(Get-CompatibilityCell $row.AzureSqlIaaSCompatibility $row.AzureSqlIaaSDetails 'section-iaas')
+$(Get-CompatibilityCell $row.AzureSqlIaaSCompatibility $row.AzureSqlIaaSDetails 'section-iaas' -StatusNote $row.AzureSqlIaaSReadinessSource)
 <td class='section-iaas'>$(ConvertTo-HtmlText $row.AzureSqlIaaSReadyWithWarnings)</td>
 $(Get-RecommendationCell $row.AzureSqlIaaSSkuRecommendation $row.AzureSqlIaaSSkuDetails 'section-iaas')
-$(Get-CostCell 'AzureSqlVirtualMachine' $row.AzureSqlIaaSSkuRecommendation 'section-iaas')
+$(Get-CostCell 'AzureSqlVirtualMachine' $row.AzureSqlIaaSSkuRecommendation 'section-iaas' $row.SourceSqlEdition)
 </tr>
 "@
 }
@@ -469,12 +530,10 @@ a:focus-visible, .table-scroll:focus-visible { outline: 2px solid var(--cp-accen
 <label class='pricing-field'>Pricing option<select id='pricing-plan'><option value='payg'>Pay as you go</option><option value='ri1'>1-year reserved instance</option><option value='ri3'>3-year reserved instance</option><option value='dbsp1'>1-year database savings plan</option></select></label>
 <label class='pricing-check'><input type='checkbox' id='pricing-ahb'>Use Azure Hybrid Benefit for eligible SQL licenses</label>
 <label class='pricing-check' id='pricing-gen5-field'><input type='checkbox' id='pricing-gen5'>Use Standard-series (Gen5) when SQL hardware is unspecified</label>
-<div id='pricing-vm-fields' class='pricing-controls'>
-<label class='pricing-field'>VM OS when unspecified<select id='pricing-vm-os'><option value=''>Select OS</option><option value='Windows'>Windows Server</option><option value='Linux'>Linux (no paid distribution license)</option></select></label>
-<label class='pricing-field'>VM SQL edition when unspecified<select id='pricing-vm-edition'><option value=''>Select edition</option><option value='Standard'>Standard</option><option value='Enterprise'>Enterprise</option><option value='Web'>Web</option></select></label>
-</div>
 </div>
 <p class='muted' id='pricing-status' role='status' aria-live='polite'></p>
+<p class='muted'>VM SQL licensing uses the edition specified in the SKU recommendation, or the assessed source server's SQL edition when unspecified. Missing or unsupported editions remain unavailable rather than being assumed.</p>
+<p class='muted'>VM operating system defaults to Windows Server when unspecified, including Windows Server licensing. Explicit Linux recommendations retain Linux pricing.</p>
 <p class='muted'><a href='pricing-options.csv'>Pricing options CSV for Ready targets</a>: generated for the command-line pricing regions (or available snapshot regions). Browser selections do not change this file.</p>
 </section>
 <section class='card'>
@@ -482,6 +541,7 @@ a:focus-visible, .table-scroll:focus-visible { outline: 2px solid var(--cp-accen
 <p class='section-description'>Compare migration targets side by side. Select Ready or Not Ready to view the underlying assessment (HTML when available, otherwise JSON), or select a SKU recommendation to open its available report.</p>
 $instanceTable
 <p class='muted'>Warnings counts databases that are Ready for the target but have one or more warning findings. A zero does not mean the target is assessed or free of compatibility blockers. Not Assessed has no assessment link.</p>
+<p class='muted'>VM readiness can be inferred from a completed, error-free assessment when JSON omits VM readiness, matching the native report's VM default. Explicit statuses and blockers are respected. Hover over the VM status for its source; the instance CSV records AzureSqlIaaSReadinessSource.</p>
 </section>
 <script type='application/json' id='pricing-data'>$pricingJson</script>
 <script>$pricingScript</script>

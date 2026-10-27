@@ -1,26 +1,55 @@
+function Get-SummaryPricingKey {
+    param([string]$Target, [string]$Recommendation, [string]$SourceSqlEdition)
+    $key = "$Target|$Recommendation"
+    if ($Target -eq 'AzureSqlVirtualMachine' -and $SourceSqlEdition) { $key += "|SourceSqlEdition:$SourceSqlEdition" }
+    return $key
+}
+
 function Get-SummaryPricingSpec {
-    param([string]$Target, [string]$Recommendation)
+    param([string]$Target, [string]$Recommendation, [string]$SourceSqlEdition)
     $spec = [ordered]@{
-        key="$Target|$Recommendation"; target=$Target; cores=0; storageGb=$null
+        key=(Get-SummaryPricingKey $Target $Recommendation $SourceSqlEdition); target=$Target; cores=0; storageGb=$null
         computeProduct=''; licenseProduct=''; storageProduct=''; storageMeter=''
         armSku=''; edition=''; os=''; disks=@(); needsHardware=$false; error=''; notes=@()
+        sourceSqlEdition=$SourceSqlEdition; editionSource=''; editionError=''
     }
     if ([string]::IsNullOrWhiteSpace($Recommendation)) {
         $spec.error = 'No SKU recommendation.'
         return [pscustomobject]$spec
     }
     if ($Target -eq 'AzureSqlVirtualMachine') {
-        $vm = [regex]::Match($Recommendation, '(?i)\bStandard_[A-Z]+\d+(?:-\d+)?[A-Z0-9_]*')
+        $sizePattern = '[A-Z]+\d+(?:-\d+)?[A-Z0-9]*(?:_[A-Z0-9]+)*'
+        $vm = [regex]::Match($Recommendation, "(?i)\bStandard_(?<size>$sizePattern)\b")
+        if (-not $vm.Success) {
+            $vm = [regex]::Match($Recommendation, "(?i)\bCompute:\s*(?:[A-Z0-9]+Family\s*-\s*)?(?<size>$sizePattern)\s+-\s+\d+\s+Available\s+vCPU\b")
+        }
+        if (-not $vm.Success) {
+            $vm = [regex]::Match($Recommendation, '(?i)\b(?<size>[A-Z]+\d+(?:-\d+)?[A-Z0-9]*(?:_[A-Z0-9]+)*_v\d+)\b')
+        }
         if (-not $vm.Success) {
             $spec.error = 'The recommendation does not identify an ARM VM size.'
             return [pscustomobject]$spec
         }
-        $spec.armSku = $vm.Value
-        $cpu = [regex]::Match($vm.Value, '(?i)^Standard_[A-Z]+(?<cores>\d+)(?:-(?<constrained>\d+))?')
-        $spec.cores = if ($cpu.Groups['constrained'].Success) { [int]$cpu.Groups['constrained'].Value } else { [int]$cpu.Groups['cores'].Value }
-        if ($Recommendation -match '(?i)\b(Standard|Enterprise|Web)\s+Edition\b') { $spec.edition = $Matches[1] }
+        $spec.armSku = 'Standard_' + $vm.Groups['size'].Value
+        $cpu = [regex]::Match($spec.armSku, '(?i)^Standard_[A-Z]+(?<cores>\d+)(?:-(?<constrained>\d+))?')
+        $availableCpu = [regex]::Match($Recommendation, '(?i)\b(?<cores>\d+)\s+Available\s+vCPU\b')
+        $spec.cores = if ($availableCpu.Success) { [int]$availableCpu.Groups['cores'].Value }
+            elseif ($cpu.Groups['constrained'].Success) { [int]$cpu.Groups['constrained'].Value }
+            else { [int]$cpu.Groups['cores'].Value }
+        if ($Recommendation -match '(?i)\b(Standard|Enterprise|Web)\s+Edition\b') {
+            $spec.edition = $Matches[1]
+            $spec.editionSource = 'SKU recommendation'
+        } elseif ($SourceSqlEdition -match '(?i)^\s*(Standard|Enterprise|Web)(?:\s|$)') {
+            $spec.edition = $Matches[1]
+            $spec.editionSource = 'Source assessment ServerEdition'
+        } elseif ($SourceSqlEdition) {
+            $spec.editionError = "Source assessed SQL edition '$SourceSqlEdition' has no supported public VM SQL license mapping; no edition was assumed."
+        } else {
+            $spec.editionError = 'SQL edition is missing from both the SKU recommendation and the source assessment.'
+        }
         if ($Recommendation -match '(?i)\bWindows\b') { $spec.os = 'Windows' }
         elseif ($Recommendation -match '(?i)\bLinux\b') { $spec.os = 'Linux' }
+        else { $spec.os = 'Windows' }
         foreach ($disk in [regex]::Matches($Recommendation, '(?i)(?:(?<count>\d+)\s*x\s*)?\b(?<sku>P\d+|E\d+|S\d+)\s*(?<redundancy>LRS|ZRS)?\b')) {
             $spec.disks += [pscustomobject]@{
                 sku=$disk.Groups['sku'].Value.ToUpperInvariant()
@@ -29,6 +58,11 @@ function Get-SummaryPricingSpec {
             }
         }
         $spec.notes = @('VM OS/data disks are included only when a disk SKU, count and redundancy are specified. Unspecified disks, disk transactions and burst charges are excluded.')
+        if ($Recommendation -notmatch '(?i)\bWindows\b|\bLinux\b') {
+            $spec.notes += 'VM OS unspecified; Windows Server assumed, including Windows Server licensing.'
+        }
+        if ($spec.edition) { $spec.notes += "SQL edition: $($spec.edition) ($($spec.editionSource))." }
+        elseif ($spec.editionError) { $spec.notes += $spec.editionError }
         return [pscustomobject]$spec
     }
     $cores = [regex]::Match($Recommendation, '(?i)\b(?<cores>\d+)\s*(?:v?cores?)\b')
@@ -111,7 +145,8 @@ function New-SummaryPricingSnapshot {
     [CmdletBinding()]
     param([array]$Recommendations, [string[]]$Regions, [switch]$SkipPricing)
     $specs = @($Recommendations | ForEach-Object {
-        Get-SummaryPricingSpec $_.Target $_.Recommendation
+        $sourceEdition = if ($_.PSObject.Properties['SourceSqlEdition']) { $_.SourceSqlEdition } else { '' }
+        Get-SummaryPricingSpec $_.Target $_.Recommendation $sourceEdition
     } | Sort-Object key -Unique)
     $snapshot = [ordered]@{
         currency='USD'; hoursPerMonth=730; generatedUtc=(Get-Date).ToUniversalTime().ToString('o')
@@ -121,9 +156,11 @@ function New-SummaryPricingSnapshot {
     $filters = @{}
     foreach ($spec in $specs | Where-Object { -not $_.error }) {
         if ($spec.target -eq 'AzureSqlVirtualMachine') {
-            $filters["serviceName eq 'Virtual Machines' and armSkuName eq '$($spec.armSku)' and skuName eq '$($spec.armSku)'"] = $true
+            $retailSku = $spec.armSku -replace '^Standard_', '' -replace '_', ' '
+            $filters["serviceName eq 'Virtual Machines' and armSkuName eq '$($spec.armSku)' and (skuName eq '$retailSku' or skuName eq '$($spec.armSku)')"] = $true
+            $licenseSku = if ($spec.cores -le 4) { '1-4 vCPU VM' } else { "$($spec.cores) vCPU VM" }
             foreach ($edition in @('Standard', 'Enterprise', 'Web')) {
-                $filters["serviceName eq 'Virtual Machines Licenses' and productName eq 'SQL Server $edition' and skuName eq '$([Math]::Max(4, $spec.cores)) vCPU VM' and priceType eq 'Consumption'"] = $true
+                $filters["serviceName eq 'Virtual Machines Licenses' and productName eq 'SQL Server $edition' and skuName eq '$licenseSku' and priceType eq 'Consumption'"] = $true
             }
             foreach ($disk in $spec.disks | Where-Object redundancy) {
                 $diskProduct = switch ($disk.sku.Substring(0, 1)) {
@@ -224,26 +261,32 @@ function Get-SummaryPriceEstimate {
         $term = switch ($Plan) { 'ri1' { '1 Year' } 'ri3' { '3 Years' } default { '' } }
         if ($Spec.target -eq 'AzureSqlVirtualMachine') {
             if ($Plan -eq 'dbsp1') { throw 'The database savings plan does not apply to SQL Server on Azure VMs.' }
-            if (-not $Spec.os) { throw 'The VM OS is unspecified; CSV estimates require an explicit OS in the recommendation.' }
-            $linux = { param($item) $item.armSkuName -eq $Spec.armSku -and $item.skuName -eq $Spec.armSku -and -not $item.productName.EndsWith(' Windows') }
-            $windows = { param($item) $item.armSkuName -eq $Spec.armSku -and $item.skuName -eq $Spec.armSku -and $item.productName.EndsWith(' Windows') }
+            $os = if ($Spec.os) { $Spec.os } else { 'Windows' }
+            if (-not $Spec.os) {
+                $assumption = 'VM OS unspecified; Windows Server assumed, including Windows Server licensing.'
+                if (-not $notes.Contains($assumption)) { $notes.Add($assumption) }
+            }
+            $vmSkuNames = @($Spec.armSku, ($Spec.armSku -replace '^Standard_', '' -replace '_', ' '))
+            $linux = { param($item) $item.armSkuName -eq $Spec.armSku -and $item.skuName -in $vmSkuNames -and -not $item.productName.EndsWith(' Windows') }
+            $windows = { param($item) $item.armSkuName -eq $Spec.armSku -and $item.skuName -in $vmSkuNames -and $item.productName.EndsWith(' Windows') }
             $base = Get-SummaryPricingMeter $Snapshot $linux $Region
             if ($term) {
                 $compute = Get-SummaryPricingMeter $Snapshot $linux $Region 'Reservation' $term
                 Add-PriceComponent "VM compute ($term RI, amortized)" (Get-Monthly $compute 1 $term) $compute
-                if ($Spec.os -eq 'Windows') {
+                if ($os -eq 'Windows') {
                     $win = Get-SummaryPricingMeter $Snapshot $windows $Region
                     Add-PriceComponent 'Windows Server license (not covered by SQL Hybrid Benefit)' ((Get-Monthly $win) - (Get-Monthly $base)) $win
                 }
             } else {
-                $predicate = if ($Spec.os -eq 'Windows') { $windows } else { $linux }
+                $predicate = if ($os -eq 'Windows') { $windows } else { $linux }
                 $compute = Get-SummaryPricingMeter $Snapshot $predicate $Region
                 Add-PriceComponent 'VM compute (including Windows license when applicable)' (Get-Monthly $compute) $compute
             }
             if (-not $Ahb) {
-                if (-not $Spec.edition) { throw 'The SQL edition is unspecified; CSV estimates require an explicit edition in the recommendation or eligible SQL Hybrid Benefit.' }
+                if (-not $Spec.edition) { throw $Spec.editionError }
+                $licenseSku = if ($Spec.cores -le 4) { '1-4 vCPU VM' } else { "$($Spec.cores) vCPU VM" }
                 $sql = Get-SummaryPricingMeter $Snapshot {
-                    param($item) $item.productName -eq "SQL Server $($Spec.edition)" -and $item.skuName -ceq "$([Math]::Max(4, $Spec.cores)) vCPU VM"
+                    param($item) $item.productName -eq "SQL Server $($Spec.edition)" -and $item.skuName -ceq $licenseSku
                 } ''
                 Add-PriceComponent "SQL Server $($Spec.edition) license" (Get-Monthly $sql) $sql
             }
@@ -322,7 +365,8 @@ function Export-SummaryPricingCsv {
         @{ name='DatabaseSavingsPlan1Year'; plan='dbsp1'; ahb=$false }, @{ name='DatabaseSavingsPlan1Year_AHB'; plan='dbsp1'; ahb=$true }
     )
     $template = [ordered]@{
-        ServerName=''; InstanceName=''; DisplayName=''; Target=''; Compatibility=''; ReadyWithWarnings=0; SKU=''
+        ServerName=''; InstanceName=''; DisplayName=''; Target=''; Compatibility=''; ReadinessSource=''; ReadyWithWarnings=0; SKU=''
+        SourceSqlEdition=''; VmSqlEdition=''; VmSqlEditionSource=''
         Region=''; Currency=$Snapshot.currency; HoursPerMonth=$Snapshot.hoursPerMonth
         PricingSnapshotUtc=([datetimeoffset]$Snapshot.generatedUtc).ToUniversalTime().ToString('o')
         Scope='Monthly subtotal for one recommended resource, not all databases. Excludes backup, networking, tax, support, HA/DR replicas and usage-based IO. Full utilization of commitments assumed. Linux paid distribution licensing excluded. Not a quote.'
@@ -341,7 +385,8 @@ function Export-SummaryPricingCsv {
                 $prefix = if ($target -eq 'AzureSqlVirtualMachine') { 'AzureSqlIaaS' } else { $target }
                 if (($instance."${prefix}Compatibility" -replace '[\s_-]', '') -ne 'Ready') { continue }
                 $recommendation = $instance."${prefix}SkuRecommendation"
-                $spec = $specs["$target|$recommendation"]
+                $sourceEdition = if ($instance.PSObject.Properties['SourceSqlEdition']) { $instance.SourceSqlEdition } else { '' }
+                $spec = $specs[(Get-SummaryPricingKey $target $recommendation $sourceEdition)]
                 if ($null -eq $spec) { throw "Pricing specification missing for Ready target '$target'." }
                 foreach ($region in $regionsToExport) {
                     $row = [ordered]@{}
@@ -351,8 +396,17 @@ function Export-SummaryPricingCsv {
                     $row.DisplayName = $instance.DisplayName
                     $row.Target = $target
                     $row.Compatibility = 'Ready'
+                    $sourceProperty = if ($target -eq 'AzureSqlVirtualMachine') { $instance.PSObject.Properties['AzureSqlIaaSReadinessSource'] } else { $null }
+                    $row.ReadinessSource = if ($sourceProperty) { $sourceProperty.Value } elseif ($target -eq 'AzureSqlVirtualMachine') {
+                        'Not recorded in instance summary'
+                    } else { 'Explicit JSON target readiness' }
                     $row.ReadyWithWarnings = $instance."${prefix}ReadyWithWarnings"
                     $row.SKU = $recommendation
+                    $row.SourceSqlEdition = $sourceEdition
+                    if ($target -eq 'AzureSqlVirtualMachine') {
+                        $row.VmSqlEdition = $spec.edition
+                        $row.VmSqlEditionSource = $spec.editionSource
+                    }
                     $row.Region = $region
                     foreach ($option in $options) {
                         $key = "$($spec.key)|$region|$($option.name)"

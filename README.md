@@ -175,14 +175,16 @@ Pass the timestamped folder produced by performance collection:
   -ScalingFactor 125
 ```
 
-By default, recommendations are generated separately for Azure SQL Database, Azure SQL Managed Instance, and the Microsoft best-fit `Any` target. Available values for `-TargetPlatform` are:
+By default, recommendations are generated separately for Azure SQL Database, Azure SQL Managed Instance, and SQL Server on Azure VMs. The optional `Any` target returns Microsoft's best fit, not a separate recommendation for every target. Available values for `-TargetPlatform` are:
 
 - `AzureSqlDatabase`
 - `AzureSqlManagedInstance`
 - `AzureSqlVirtualMachine`
 - `Any`
 
-`TargetPercentile` selects the utilization percentile used for sizing. `ScalingFactor` applies capacity headroom as a percentage; for example, `125` adds 25 percent. `-ElasticStrategy` enables the cmdlet's elastic strategy when that behavior is desired.
+`TargetPercentile` selects the utilization percentile used for sizing. `ScalingFactor` applies capacity headroom as a percentage; for example, `125` adds 25 percent. `-ElasticStrategy` enables the cmdlet's elastic strategy for `AzureSqlDatabase` and `Any`. For `AzureSqlManagedInstance` and `AzureSqlVirtualMachine`, the script always passes `ElasticStrategy=false` and uses baseline sizing, even when the switch is supplied for a mixed-target run. Overridden requests produce a warning. The generated `recommendation-settings.json` records the requested switch in `ElasticStrategy` and the effective setting for each target in `ElasticStrategyByTarget`.
+
+Run `.\tests\Test-Generate-SkuRecommendations.ps1` to validate strategy routing and settings with mocked recommendations (no SQL Server, Az.DataMigration installation, or Azure connection required).
 
 Example for selected targets:
 
@@ -218,6 +220,10 @@ All generated report links, including the instance CSV's detail links and `Asses
 
 Warnings counts databases that are Ready for that target and have at least one warning finding, matching the existing SQL Database and Managed Instance warning-count behavior and extending it to Azure VM. It is not a total finding count; zero does not imply that the target was assessed or has no blockers. The instance CSV retains its existing fields and adds `AzureSqlIaaSReadyWithWarnings` for VM warning counts. Missing SKU recommendations display as **Not available** in the HTML report.
 
+VM assessment JSON can omit VM readiness when there are no VM findings; the native HTML treats VMs as Ready in this case. The summary recognizes `SqlServerOnAzureVM`, `AzureSqlVirtualMachine`, and `AzureSqlIaaS` as VM target names. Explicit JSON readiness takes precedence, including Not Ready, Unknown, and Not Assessed. When VM readiness is absent, the summary infers Ready only for completed, error-free reports and servers with at least one database, all with Ready VM evidence or completed, error-free database assessments. VM findings categorized as Issue, BlockingIssue, or Critical make the inferred status Not Ready. Incomplete, failed, empty, or errored assessments are not inferred Ready. Warnings alone do not make a VM Not Ready.
+
+The VM status tooltip and the instance CSV's `AzureSqlIaaSReadinessSource` distinguish explicit readiness from this completed-assessment fallback. Inferred Ready targets also qualify for the pricing CSV, whose `ReadinessSource` retains that distinction; missing SKU or pricing data still produces Unavailable costs, not fabricated prices. These readiness statuses indicate assessment compatibility, not a guarantee of migration or deployment success.
+
 To validate summary generation with synthetic fixtures (no SQL Server or Azure connection required), run `.\tests\Test-Summarize-Results.ps1` in Windows PowerShell 5.1 or PowerShell 7. Add `-KeepArtifacts` to retain the generated reports for visual inspection; otherwise the tests clean up their temporary files.
 
 #### Offline monthly cost estimates
@@ -243,7 +249,7 @@ The same command generates `pricing-options.csv` alongside the HTML report. Use 
 
 Eight `*_MonthlyUSD` columns compare PAYG, 1-year reservations, 3-year reservations, and 1-year database savings plans, each with and without SQL Azure Hybrid Benefit. Values are monthly USD subtotals with two decimal places, no currency symbols or thousands separators. Reservations are amortized over their term, not shown as upfront purchase totals. Each option's `*_Details` column supplies its component breakdown, source meter IDs, exclusions, AHB eligibility assumptions, or reason for **Unavailable**. Unsupported plans and missing meters never fall back to PAYG or zero.
 
-The export reuses the report's pricing snapshot without additional API calls or runtime dependencies. Snapshot timestamp, currency, hours/month, scope, and pricing query warnings are included for offline analysis. Missing hardware, VM OS, or SQL edition is not guessed; affected options are unavailable. Browser selections do not change the CSV. Regenerate after updating recommendations or to refresh prices.
+The export reuses the report's pricing snapshot without additional API calls or runtime dependencies. Snapshot timestamp, currency, hours/month, scope, and pricing query warnings are included for offline analysis. VM SQL edition comes from an explicit recommendation or, when unspecified, the source assessment's `Properties.ServerEdition`. The instance CSV retains `SourceSqlEdition`; the pricing CSV also records the resolved `VmSqlEdition` and `VmSqlEditionSource`. Identical VM recommendations on different instances retain their own assessed edition and license price. An unspecified VM OS defaults to Windows Server, including Windows licensing; this assumption appears in the cost details. Explicit Linux recommendations retain Linux pricing. Missing hardware or SQL edition is not guessed; affected options are unavailable. Browser selections do not change the CSV. Regenerate after updating recommendations or to refresh prices.
 
 Without `-PricingRegion`, the CSV covers the public regions with compute rates in the snapshot. With an explicit region, Ready targets are exported even when regional prices are missing or `-SkipPricing` is set, with unavailable options and reasons. If no Ready targets or no regions are available, the CSV contains headers only and generation emits a warning; previous CSV rows are replaced, not retained.
 
@@ -257,9 +263,11 @@ Options:
 
 Estimates assume **USD**, **730 hours/month**, full utilization of the selected commitment, and one displayed recommended resource (not every database on its source server). RI and savings-plan discounts apply to eligible compute only; SQL licensing and storage stay at their published rates. Each populated cell exposes its monthly component breakdown, source meter IDs, and exclusions.
 
-Supported mappings include provisioned SQL Database and Managed Instance vCore recommendations with recognizable service tier and hardware, and identifiable ARM VM sizes. When hardware is absent, explicitly select Standard-series (Gen5) in the report; it is never assumed silently. VM OS and SQL edition must be present in the recommendation or explicitly selected in the report. Linux estimates exclude paid distribution licensing. [Next-gen General Purpose MI uses General Purpose baseline billing](https://learn.microsoft.com/azure/azure-sql/managed-instance/service-tiers-next-gen-general-purpose-use); extra memory and IOPS are excluded.
+Supported mappings include provisioned SQL Database and Managed Instance vCore recommendations with recognizable service tier and hardware, and identifiable ARM VM sizes. Native VM names such as `D2as_v4` are normalized to `Standard_D2as_v4`; already-prefixed names and constrained-vCPU sizes are also supported. VM prices match the ARM size and its retail SKU name (for example, `D2as v4`), excluding Spot and Low Priority meters. Regenerate older reports to capture these VM meters. When hardware is absent, explicitly select Standard-series (Gen5) in the report; it is never assumed silently. VM OS uses the recommendation when specified and otherwise defaults to Windows Server; there is no OS selector. VM SQL edition uses an explicit recommendation first, otherwise the assessed source server's edition; there is no SQL edition selector. Standard, Enterprise, and Web source editions map to their public SQL license meters. Developer, Express, missing, and unknown source editions are not silently converted to paid editions or assumed to have free SQL licensing; non-AHB estimates remain Unavailable with a reason when no supported edition can be resolved. AHB still requires sufficient eligible licenses and never waives Windows licensing. Linux estimates exclude paid distribution licensing. [Next-gen General Purpose MI uses General Purpose baseline billing](https://learn.microsoft.com/azure/azure-sql/managed-instance/service-tiers-next-gen-general-purpose-use); extra memory and IOPS are excluded.
 
 Recommended SQL storage GB is priced when the appropriate storage meter exists. VM managed disks are included only when the recommendation specifies recognizable disk SKUs (P/E/S series), counts, and LRS/ZRS redundancy; otherwise the breakdown explicitly excludes the unresolved storage. Disk transactions, backups, networking, tax, support, additional HA/DR replicas, and usage-based IO are excluded. Serverless, DTU, elastic pools, zone-redundant SQL, unknown hardware, missing regional/term meters, and ambiguous matches display **Unavailable** where they cannot be priced reliably. A priced subtotal with excluded components is not an all-in deployment quote, and a meter's presence does not guarantee resource availability in that region.
+
+VM SQL licensing uses the published `1-4 vCPU VM` meter for sizes with up to four vCPUs. Native `Available vCPU` counts take precedence over digits in the size name, which do not always represent core counts for older VM families.
 
 Run `.\tests\Test-SummaryPricing.ps1` for deterministic snapshot/mapping tests with mocked API responses (no network required). Add `-KeepArtifacts`, open the printed browser test report, and inspect `document.body.dataset.pricingTests` for `passed`; the embedded browser regression suite checks cost arithmetic, discounts, Hybrid Benefit, missing prices, and offline UI changes.
 

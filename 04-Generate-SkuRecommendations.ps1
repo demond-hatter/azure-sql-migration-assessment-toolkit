@@ -3,7 +3,7 @@ param(
     [Parameter(Mandatory)][string]$PerformanceFolder,
     [string]$OutputRoot = (Join-Path $PSScriptRoot 'results'),
     [ValidateSet('AzureSqlDatabase','AzureSqlManagedInstance','AzureSqlVirtualMachine','Any')]
-    [string[]]$TargetPlatform = @('AzureSqlDatabase','AzureSqlManagedInstance','Any'),
+    [string[]]$TargetPlatform = @('AzureSqlDatabase','AzureSqlManagedInstance','AzureSqlVirtualMachine'),
     [ValidateRange(50,200)][int]$TargetPercentile = 95,
     [ValidateRange(100,300)][int]$ScalingFactor = 125,
     [switch]$ElasticStrategy
@@ -21,6 +21,14 @@ if ($instanceFolders.Count -eq 0) {
     $instanceFolders = @((Get-Item $PerformanceFolder))
 }
 
+$elasticStrategyByTarget = [ordered]@{}
+foreach ($target in $TargetPlatform) {
+    $elasticStrategyByTarget[$target] = [bool]$ElasticStrategy -and ($target -notin @('AzureSqlManagedInstance','AzureSqlVirtualMachine'))
+    if ($ElasticStrategy -and -not $elasticStrategyByTarget[$target]) {
+        Write-Warning "ElasticStrategy is disabled for $target; using baseline sizing."
+    }
+}
+
 foreach ($instanceFolder in $instanceFolders) {
     $sourceName = ($instanceFolder.Name -replace '[^A-Za-z0-9._-]', '_')
     foreach ($target in $TargetPlatform) {
@@ -34,8 +42,8 @@ foreach ($instanceFolder in $instanceFolders) {
             ScalingFactor=$ScalingFactor
             Overwrite=$true
             DisplayResult=$true
+            ElasticStrategy=$elasticStrategyByTarget[$target]
         }
-        if ($ElasticStrategy) { $params.ElasticStrategy = $true }
         $targetFolder = Join-Path $runFolder (Join-Path $sourceName $target)
         New-Item -ItemType Directory -Path $targetFolder -Force | Out-Null
         $consolePath = Join-Path $targetFolder "$sourceName-$target-console.txt"
@@ -53,6 +61,7 @@ foreach ($instanceFolder in $instanceFolders) {
 }
 @{
     PerformanceFolder=$PerformanceFolder; Targets=$TargetPlatform; TargetPercentile=$TargetPercentile
-    ScalingFactor=$ScalingFactor; ElasticStrategy=[bool]$ElasticStrategy; GeneratedUtc=(Get-Date).ToUniversalTime().ToString('o')
+    ScalingFactor=$ScalingFactor; ElasticStrategy=[bool]$ElasticStrategy
+    ElasticStrategyByTarget=$elasticStrategyByTarget; GeneratedUtc=(Get-Date).ToUniversalTime().ToString('o')
 } | ConvertTo-Json -Depth 4 | Set-Content (Join-Path $runFolder 'recommendation-settings.json')
 Write-Host "Recommendations completed. Output: $runFolder"
